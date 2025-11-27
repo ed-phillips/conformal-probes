@@ -34,7 +34,7 @@ def main():
             cmd = [
                 "python",
                 "-m", "semantic_uncertainty.generate_answers",
-                "--model_name", model_name_for_sep,
+                "--model_name", model,
                 "--dataset", ds,
                 "--num_samples", str(gen.get("num_samples", 2000)),
                 "--num_generations", str(gen.get("num_generations", 10)),
@@ -43,6 +43,7 @@ def main():
                 "--model_max_new_tokens", str(gen.get("model_max_new_tokens", 50)),
                 "--metric", "hf_judge",
                 "--brief_prompt", gen.get("brief_prompt", "default"),
+        
             ]
 
             # HF-judge labeler
