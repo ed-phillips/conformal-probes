@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #SBATCH --nodes=1
 #SBATCH --partition=gpu_long
-#SBATCH --time=48:00:00
+#SBATCH --time=60:00:00
 #SBATCH --job-name=sep_sweep
 #SBATCH --gpus-per-node=1
 #SBATCH --cpus-per-task=8
