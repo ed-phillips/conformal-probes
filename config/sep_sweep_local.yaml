@@ -1,0 +1,27 @@
+models:
+  - Qwen/Qwen3-1.7B
+
+judge_model: Qwen/Qwen3-1.7B
+
+datasets:
+  - trivia_qa
+
+generation:
+  num_samples: 50          
+  num_generations: 10
+  num_few_shot: 0
+  temperature: 1.0
+  model_max_new_tokens: 64
+  brief_prompt: chat
+  metric: hf_judge
+  use_context: false
+
+semantic_entropy:
+  entailment_model: deberta      # your DeBERTa MNLI config
+  strict_entailment: true
+  use_all_generations: true
+
+probes:
+  n_samples: 8   50               # match num_samples for simplicity
+  entropy_key: cluster_assignment_entropy
+  token_positions: [tbg, slt]
