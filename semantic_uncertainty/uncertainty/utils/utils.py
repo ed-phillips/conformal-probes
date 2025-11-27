@@ -92,7 +92,7 @@ def get_parser(stages=['generate', 'compute']):
             help=(
                 "Only get embedding of most likely answer for training set. "
                 "This is all that's needed for p_true."))
-        parser.add_argument('--compute_p_true', default=True,
+        parser.add_argument('--compute_p_true', default=False,
                             action=argparse.BooleanOptionalAction)
         parser.add_argument(
             "--brief_always", default=False, action=argparse.BooleanOptionalAction)
@@ -121,7 +121,7 @@ def get_parser(stages=['generate', 'compute']):
         parser.add_argument('--num_eval_samples', type=int, default=int(1e19))
         parser.add_argument('--compute_predictive_entropy',
                             default=True, action=argparse.BooleanOptionalAction)
-        parser.add_argument('--compute_p_ik', default=True,
+        parser.add_argument('--compute_p_ik', default=False,
                             action=argparse.BooleanOptionalAction)
         parser.add_argument('--compute_p_ik_answerable', default=False,
                             action=argparse.BooleanOptionalAction)
@@ -303,12 +303,10 @@ def get_reference(example):
 
 def init_model(args):
     mn = args.model_name
-    if 'llama' in mn.lower() or 'falcon' in mn.lower() or 'mistral' in mn.lower() or 'phi' in mn.lower():
-        model = HuggingfaceModel(
-            mn, stop_sequences='default',
-            max_new_tokens=args.model_max_new_tokens)
-    else:
-        raise ValueError(f'Unknown model_name `{mn}`.')
+    model = HuggingfaceModel(
+        mn, stop_sequences='default',
+        max_new_tokens=args.model_max_new_tokens)
+        
     return model
 
 
