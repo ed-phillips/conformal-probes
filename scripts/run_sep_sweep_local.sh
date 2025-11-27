@@ -48,6 +48,6 @@ python scripts/compute_semantic_entropy_local.py \
 python scripts/train_probes.py \
   --config "${CFG_YAML}" \
   --runs-root "${RUNS_ROOT}" \
-  --out "${RUNS_ROOT}/probes_local.pkl"
+  --out "${RUNS_ROOT}/probes.pkl"
 
 echo "Done. Inspect runs in ${RUNS_ROOT}"
