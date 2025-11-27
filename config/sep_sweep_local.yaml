@@ -22,6 +22,6 @@ semantic_entropy:
   use_all_generations: true
 
 probes:
-  n_samples: 8   50               # match num_samples for simplicity
+  n_samples: 50              # match num_samples for simplicity
   entropy_key: cluster_assignment_entropy
   token_positions: [tbg, slt]
