@@ -46,7 +46,7 @@ def get_parser(stages=['generate', 'compute']):
         )
         parser.add_argument(
             "--dataset", type=str, default="trivia_qa",
-            choices=['trivia_qa', 'squad', 'bioasq', 'nq', 'svamp'],
+            choices=['trivia_qa', 'squad', 'bioasq', 'nq', 'svamp', 'med_qa'],
             help="Dataset to use")
         parser.add_argument(
             "--ood_train_dataset", type=str, default=None,
@@ -106,6 +106,9 @@ def get_parser(stages=['generate', 'compute']):
             "--answerable_only", default=False,
             action=argparse.BooleanOptionalAction,
             help='Exclude unanswerable questions.')
+        parser.add_argument(
+            "--judge_model_name", type=str, default=None,
+            help="HF CausalLM id for LLM-as-judge when metric='hf_judge'.")
 
     if 'compute' in stages:
         parser.add_argument('--recompute_accuracy',
@@ -145,6 +148,10 @@ def get_parser(stages=['generate', 'compute']):
         parser.add_argument('--reuse_entailment_model',
                             default=False, action=argparse.BooleanOptionalAction,
                             help='Use entailment model as p_true model.')
+        # make recompute_accuracy / p_true able to use the same judge
+        parser.add_argument(
+            "--judge_model_name", type=str, default=None,
+            help="HF CausalLM id for LLM-as-judge when metric='hf_judge'.")
     return parser
 
 
@@ -263,6 +270,31 @@ def get_gpt_metric(metric_name):
     return gpt_metric
 
 
+def get_hf_judge_metric(judge_model_name):
+    """Return a metric function that uses a HF CausalLM as LLM-as-judge."""
+
+    if judge_model_name is None:
+        raise ValueError("hf_judge metric requires --judge_model_name to be set")
+
+    # Import here to avoid circular imports at module load
+    from uncertainty.models.huggingface_models import HuggingfaceModel
+
+    # judge is a separate model; keep max_new_tokens small
+    judge_model = HuggingfaceModel(
+        judge_model_name,
+        stop_sequences='default',
+        max_new_tokens=32,
+    )
+
+    def hf_metric(predicted_answer, example, model):
+        # We ignore `model` here and instead use `judge_model`
+        del model
+        return model_based_metric(predicted_answer, example, judge_model)
+
+    return hf_metric
+
+
+
 def get_reference(example):
     if 'answers' not in example:
         example = example['reference']
@@ -303,7 +335,7 @@ def get_make_prompt(args):
     return make_prompt
 
 
-def get_metric(metric):
+def get_metric(metric, hf_judge_model_name=None):
     if metric == 'squad':
 
         squad_metric = load("squad_v2")
@@ -330,6 +362,8 @@ def get_metric(metric):
         metric = get_gpt_metric(metric)
     elif metric == 'llm_gpt-4':
         metric = get_gpt_metric(metric)
+    elif metric == 'hf_judge':
+        metric = get_hf_judge_metric(hf_judge_model_name)
     else:
         raise ValueError
 
