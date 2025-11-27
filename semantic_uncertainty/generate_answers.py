@@ -50,7 +50,8 @@ def main(args):
     )
     logging.info('Finished wandb init.')
 
-    metric = utils.get_metric(args.metric)
+    metric = utils.get_metric(args.metric, hf_judge_model_name=args.judge_model_name)
+
 
     train_dataset, validation_dataset = load_ds(
         args.dataset, add_options=args.use_mc_options, seed=args.random_seed)
