@@ -21,7 +21,7 @@ class SEPData:
 def load_sep_dataset(run_dir: Path, n_sample: int, entropy_key: str) -> SEPData:
     with (run_dir / "validation_generations.pkl").open("rb") as f:
         generations = pickle.load(f)
-    with (run_dir / "uncertainty_measures_local.pkl").open("rb") as f:
+    with (run_dir / "uncertainty_measures.pkl").open("rb") as f:
         measures = pickle.load(f)
 
     entropy = torch.tensor(
