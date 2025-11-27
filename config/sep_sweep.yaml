@@ -17,7 +17,7 @@ generation:
   temperature: 1.0
   model_max_new_tokens: 100
   brief_prompt: chat
-  metric: llm_gpt-4          # or 'squad' if you want to avoid OpenAI on HPC
+  metric: hf_judge        # or 'squad' if you want to avoid OpenAI on HPC
   use_context: false
 
 semantic_entropy:
