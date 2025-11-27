@@ -8,8 +8,8 @@ import wandb
 
 from evaluate import load
 
-from uncertainty.models.huggingface_models import HuggingfaceModel
-from uncertainty.utils import openai as oai
+from semantic_uncertainty.uncertainty.models.huggingface_models import HuggingfaceModel
+from semantic_uncertainty.uncertainty.utils import openai as oai
 
 BRIEF_PROMPTS = {
     'default': "Answer the following question as briefly as possible.\n",
@@ -27,7 +27,7 @@ def get_parser(stages=['generate', 'compute']):
     parser.add_argument('--random_seed', type=int, default=10)
     parser.add_argument(
         "--metric", type=str, default="squad",
-        choices=['squad', 'llm', 'llm_gpt-3.5', 'llm_gpt-4'],
+        choices=['squad', 'llm', 'llm_gpt-3.5', 'llm_gpt-4', 'hf_judge'],
         help="Metric to assign accuracy to generations.")
     parser.add_argument(
         "--compute_accuracy_at_all_temps",
@@ -36,6 +36,10 @@ def get_parser(stages=['generate', 'compute']):
     parser.add_argument(
         "--experiment_lot", type=str, default='Unnamed Experiment',
         help="Keep default wandb clean.")
+    parser.add_argument(
+        "--judge_model_name", type=str, default=None,
+        help="HF CausalLM id for LLM-as-judge when metric='hf_judge'.",
+    )
     if 'generate' in stages:
         parser.add_argument(
             "--model_name", type=str, default="Llama-2-7b-chat", help="Model name",
@@ -106,9 +110,6 @@ def get_parser(stages=['generate', 'compute']):
             "--answerable_only", default=False,
             action=argparse.BooleanOptionalAction,
             help='Exclude unanswerable questions.')
-        parser.add_argument(
-            "--judge_model_name", type=str, default=None,
-            help="HF CausalLM id for LLM-as-judge when metric='hf_judge'.")
 
     if 'compute' in stages:
         parser.add_argument('--recompute_accuracy',
@@ -148,10 +149,6 @@ def get_parser(stages=['generate', 'compute']):
         parser.add_argument('--reuse_entailment_model',
                             default=False, action=argparse.BooleanOptionalAction,
                             help='Use entailment model as p_true model.')
-        # make recompute_accuracy / p_true able to use the same judge
-        parser.add_argument(
-            "--judge_model_name", type=str, default=None,
-            help="HF CausalLM id for LLM-as-judge when metric='hf_judge'.")
     return parser
 
 
@@ -277,7 +274,7 @@ def get_hf_judge_metric(judge_model_name):
         raise ValueError("hf_judge metric requires --judge_model_name to be set")
 
     # Import here to avoid circular imports at module load
-    from uncertainty.models.huggingface_models import HuggingfaceModel
+    from semantic_uncertainty.uncertainty.models.huggingface_models import HuggingfaceModel
 
     # judge is a separate model; keep max_new_tokens small
     judge_model = HuggingfaceModel(

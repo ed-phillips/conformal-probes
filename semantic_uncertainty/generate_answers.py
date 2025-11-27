@@ -10,10 +10,10 @@ import torch
 import openai
 import wandb
 
-from uncertainty.data.data_utils import load_ds
-from uncertainty.utils import utils
-from uncertainty.uncertainty_measures import p_true as p_true_utils
-from compute_uncertainty_measures import main as main_compute
+from semantic_uncertainty.uncertainty.data.data_utils import load_ds
+from semantic_uncertainty.uncertainty.utils import utils
+from semantic_uncertainty.uncertainty.uncertainty_measures import p_true as p_true_utils
+from .compute_uncertainty_measures import main as main_compute
 
 
 utils.setup_logger()
@@ -34,8 +34,8 @@ def main(args):
     random.seed(args.random_seed)
 
     # Implement
-    user = os.environ['USER']
-    entity = os.environ['WANDB_ENT']
+    user = os.getenv('USER')
+    entity = os.getenv('WANDB_ENT')
     slurm_jobid = os.getenv('SLURM_JOB_ID', None)
     scratch_dir = os.getenv('SCRATCH_DIR', '.')
     if not os.path.exists(f"{scratch_dir}/{user}/uncertainty"):
@@ -44,6 +44,7 @@ def main(args):
     wandb.init(
         entity=entity,
         project="semantic_uncertainty" if not args.debug else "semantic_uncertainty_debug",
+        mode=os.getenv("WANDB_MODE", "offline"),
         dir=f"{scratch_dir}/{user}/uncertainty",
         config=args,
         notes=f'slurm_id: {slurm_jobid}, experiment_lot: {args.experiment_lot}',

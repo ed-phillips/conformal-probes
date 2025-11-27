@@ -8,8 +8,8 @@ import pickle
 import numpy as np
 import wandb
 
-from uncertainty.utils import utils
-from uncertainty.utils.eval_utils import (
+from semantic_uncertainty.uncertainty.utils import utils
+from semantic_uncertainty.uncertainty.utils.eval_utils import (
     bootstrap, compatible_bootstrap, auroc, accuracy_at_quantile,
     area_under_thresholded_accuracy)
 

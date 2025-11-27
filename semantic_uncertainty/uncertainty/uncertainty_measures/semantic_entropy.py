@@ -12,9 +12,9 @@ import torch.nn.functional as F
 
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
-from uncertainty.models.huggingface_models import HuggingfaceModel
-from uncertainty.utils import openai as oai
-from uncertainty.utils import utils
+from semantic_uncertainty.uncertainty.models.huggingface_models import HuggingfaceModel
+from semantic_uncertainty.uncertainty.utils import openai as oai
+from semantic_uncertainty.uncertainty.utils import utils
 
 
 random.seed(10)
