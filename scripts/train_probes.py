@@ -18,7 +18,7 @@ class SEPData:
     entropy: torch.Tensor       # [N]
     accuracies: torch.Tensor    # [N]
 
-def load_sep_dataset(run_dir: Path, n_sample: int, entropy_key: str) -> SEPData:
+def load_sep_dataset(run_dir: Path, n_samples: int, entropy_key: str) -> SEPData:
     with (run_dir / "validation_generations.pkl").open("rb") as f:
         generations = pickle.load(f)
     with (run_dir / "uncertainty_measures.pkl").open("rb") as f:
@@ -43,10 +43,10 @@ def load_sep_dataset(run_dir: Path, n_sample: int, entropy_key: str) -> SEPData:
     ).squeeze(-2).transpose(0, 1).to(torch.float32)
 
     # truncate
-    tbg = tbg[:, :n_sample, :]
-    slt = slt[:, :n_sample, :]
-    entropy = entropy[:n_sample]
-    accuracies = accuracies[:n_sample]
+    tbg = tbg[:, :n_samples, :]
+    slt = slt[:, :n_samples, :]
+    entropy = entropy[:n_samples]
+    accuracies = accuracies[:n_samples]
 
     return SEPData(
         name=run_dir.name,
@@ -152,8 +152,8 @@ def main():
             if not (run_dir / "validation_generations.pkl").exists():
                 print(f"Skipping {run_dir}, missing validation_generations.pkl")
                 continue
-            if not (run_dir / "uncertainty_measures_local.pkl").exists():
-                print(f"Skipping {run_dir}, missing uncertainty_measures_local.pkl")
+            if not (run_dir / "uncertainty_measures.pkl").exists():
+                print(f"Skipping {run_dir}, missing uncertainty_measures.pkl")
                 continue
 
             D = load_sep_dataset(run_dir, n_samples, entropy_key)
