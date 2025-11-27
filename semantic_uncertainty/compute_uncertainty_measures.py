@@ -139,7 +139,12 @@ def main(args):
             brief_always=old_exp['args'].brief_always and old_exp['args'].enable_brief,
             make_prompt=utils.get_make_prompt(old_exp['args']),
             num_generations=num_gen,
-            metric=utils.get_metric(old_exp['args'].metric))
+            metric=utils.get_metric(
+                old_exp['args'].metric,
+                hf_judge_model_name=getattr(old_exp['args'], "judge_model_name", None),
+            ),
+        )
+
         wandb.config.update(
             {'p_true_num_fewshot': len_p_true}, allow_val_change=True)
         wandb.log(dict(len_p_true=len_p_true))
@@ -152,7 +157,8 @@ def main(args):
 
     if args.recompute_accuracy:
         logging.warning('Recompute accuracy enabled. This does not apply to precomputed p_true!')
-        metric = utils.get_metric(args.metric)
+        metric = utils.get_metric(args.metric, hf_judge_model_name=args.judge_model_name)
+
 
     result_dict_pickle = restore('uncertainty_measures.pkl')
     with open(result_dict_pickle.name, "rb") as infile:
