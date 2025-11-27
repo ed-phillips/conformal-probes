@@ -89,56 +89,68 @@ class HuggingfaceModel(BaseModel):
 
     def __init__(self, model_name, stop_sequences=None, max_new_tokens=None):
         if max_new_tokens is None:
-            raise
+            raise ValueError("max_new_tokens must be provided")
         self.max_new_tokens = max_new_tokens
 
         if stop_sequences == 'default':
             stop_sequences = STOP_SEQUENCES
-        print(model_name)
-        if 'llama' in model_name.lower():
+        elif stop_sequences is None:
+            stop_sequences = []
+        self.model_name = model_name
 
+        # -----------------------------
+        # 1) Backwards-compatible Llama-2 shortcut
+        # -----------------------------
+        if 'llama' in model_name.lower() and not model_name.startswith(("meta-llama/", "huggyllama/")):
+            # Existing logic, slightly cleaned up
+            print(model_name)
             if model_name.endswith('-8bit'):
-                kwargs = {'quantization_config': BitsAndBytesConfig(
-                    load_in_8bit=True,)}
-                model_name = model_name[:-len('-8bit')]
-                eightbit = True
+                kwargs = {'quantization_config': BitsAndBytesConfig(load_in_8bit=True)}
+                model_name_clean = model_name[:-len('-8bit')]
             else:
                 kwargs = {}
-                eightbit = False
+                model_name_clean = model_name
 
-            if 'Llama-2' in model_name or 'Llama-3' in model_name:
+            if 'Llama-2' in model_name_clean or 'Llama-3' in model_name_clean:
                 base = 'meta-llama'
-                model_name = model_name + '-hf' if 'Llama-2' in model_name else model_name
+                # Original code appends -hf for Llama-2
+                hf_name = model_name_clean + '-hf' if 'Llama-2' in model_name_clean else model_name_clean
             else:
                 base = 'huggyllama'
+                hf_name = model_name_clean
+
+            model_id = f"{base}/{hf_name}"
 
             self.tokenizer = AutoTokenizer.from_pretrained(
-                f"{base}/{model_name}", device_map="auto",
-                token_type_ids=None)
+                model_id, device_map="auto", token_type_ids=None
+            )
 
-            llama65b = '65b' in model_name.lower() and base == 'huggyllama'
-            llama2or3_70b = '70b' in model_name.lower() and base == 'meta-llama'
+            llama65b = '65b' in hf_name.lower() and base == 'huggyllama'
+            llama2or3_70b = '70b' in hf_name.lower() and base == 'meta-llama'
 
-            if ('7b' in model_name or '13b' in model_name) or eightbit:
+            if ('7b' in hf_name or '13b' in hf_name) or kwargs.get('quantization_config') is not None:
                 self.model = AutoModelForCausalLM.from_pretrained(
-                    f"{base}/{model_name}", device_map="auto",
-                    max_memory={0: '80GIB'}, **kwargs,)
-
+                    model_id,
+                    device_map="auto",
+                    max_memory={0: '80GIB'},
+                    **kwargs,
+                )
             elif llama2or3_70b or llama65b:
+                # keep their multi-GPU logic if you need it
                 path = snapshot_download(
-                    repo_id=f'{base}/{model_name}',
+                    repo_id=model_id,
                     allow_patterns=['*.json', '*.model', '*.safetensors'],
                     ignore_patterns=['pytorch_model.bin.index.json']
                 )
-                config = AutoConfig.from_pretrained(f"{base}/{model_name}")
+                config = AutoConfig.from_pretrained(model_id)
                 with accelerate.init_empty_weights():
                     self.model = AutoModelForCausalLM.from_config(config)
                 self.model.tie_weights()
-                if 'chat' in model_name:
+                if 'chat' in hf_name:
                     max_mem = 17.5 * 4686198491
                 else:
                     max_mem = 15 * 4686198491
-                
+
                 device_map = accelerate.infer_auto_device_map(
                     self.model.model,
                     max_memory={0: max_mem, 1: max_mem},
@@ -151,77 +163,52 @@ class HuggingfaceModel(BaseModel):
                 self.model = accelerate.load_checkpoint_and_dispatch(
                     self.model, path, device_map=full_model_device_map,
                     dtype='float16', skip_keys='past_key_values')
-
             else:
-                raise ValueError
+                raise ValueError(f"Unhandled Llama variant: {model_name}")
 
-        elif 'mistral' in model_name.lower():
-
-            if model_name.endswith('-8bit'):
-                kwargs = {'quantization_config': BitsAndBytesConfig(
-                    load_in_8bit=True,)}
-                model_name = model_name[:-len('-8bit')]
-            if model_name.endswith('-4bit'):
-                kwargs = {'quantization_config': BitsAndBytesConfig(
-                    load_in_4bit=True,)}
-                model_name = model_name[:-len('-8bit')]
-            else:
-                kwargs = {}
-
-            model_id = f'mistralai/{model_name}'
-            self.tokenizer = AutoTokenizer.from_pretrained(
-                model_id, device_map='auto', token_type_ids=None,
-                clean_up_tokenization_spaces=False)
-
-            self.model = AutoModelForCausalLM.from_pretrained(
-                model_id,
-                device_map='auto',
-                max_memory={0: '80GIB'},
-                **kwargs,
-            )
-
-        elif 'falcon' in model_name:
-            model_id = f'tiiuae/{model_name}'
-            self.tokenizer = AutoTokenizer.from_pretrained(
-                model_id, device_map='auto', token_type_ids=None,
-                clean_up_tokenization_spaces=False)
-
-            kwargs = {'quantization_config': BitsAndBytesConfig(
-                load_in_8bit=True,)}
-
-            self.model = AutoModelForCausalLM.from_pretrained(
-                model_id,
-                trust_remote_code=True,
-                device_map='auto',
-                **kwargs,
-            )
-        elif 'phi' in model_name.lower():
-            model_id = f'microsoft/{model_name}'  # e.g. Phi-3-mini-128k-instruct
-            self.tokenizer = AutoTokenizer.from_pretrained(
-                model_id, device_map='auto', token_type_ids=None,
-                clean_up_tokenization_spaces=False)
-            self.model = AutoModelForCausalLM.from_pretrained(
-                model_id,
-                trust_remote_code=True,
-                device_map='auto',
-            )
-        elif 'gemma' in model_name:
-            model_id = f'google/{model_name}'  # e.g. gemma-7b-it
-            self.tokenizer = AutoTokenizer.from_pretrained(
-                model_id, device_map='auto', token_type_ids=None,
-                clean_up_tokenization_spaces=False)
-            self.model = AutoModelForCausalLM.from_pretrained(
-                model_id,
-                trust_remote_code=True,
-                device_map='auto',
-                torch_dtype=torch.bfloat16
-            )
+        # -----------------------------
+        # 2) Everything else: treat model_name as full HF repo id
+        # -----------------------------
         else:
-            raise ValueError
+            # Here you can pass e.g.:
+            #   meta-llama/Meta-Llama-3.1-8B-Instruct
+            #   Qwen/Qwen2.5-7B-Instruct
+            #   mistralai/Ministral-8B-Instruct-2410
+            #   HuggingFaceTB/SmolLM3-3B-Instruct
+            model_id = model_name
 
-        self.model_name = model_name
-        self.stop_sequences = stop_sequences + [self.tokenizer.eos_token]
-        self.token_limit = 4096 if 'Llama-2' in model_name else 2048
+            # For many “modern” models you *must* set trust_remote_code=True
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                model_id,
+                device_map="auto",
+                token_type_ids=None,
+                clean_up_tokenization_spaces=False,
+                trust_remote_code=True,
+            )
+
+            self.model = AutoModelForCausalLM.from_pretrained(
+                model_id,
+                device_map="auto",
+                # you can add quantization here if you like:
+                # quantization_config=BitsAndBytesConfig(load_in_4bit=True),
+                trust_remote_code=True,
+            )
+
+        # -----------------------------
+        # 3) Stop sequences & token limit
+        # -----------------------------
+        # Always include EOS.
+        eos = getattr(self.tokenizer, "eos_token", None)
+        self.stop_sequences = list(stop_sequences)
+        if eos is not None and eos not in self.stop_sequences:
+            self.stop_sequences.append(eos)
+
+        # Use model config to infer context length instead of hardcoding 4096/2048
+        try:
+            config = AutoConfig.from_pretrained(model_id)
+            self.token_limit = getattr(config, "max_position_embeddings", 2048)
+        except Exception:
+            self.token_limit = 2048
 
     
     def predict(self, input_data, temperature, return_full=False, return_latent=False):
