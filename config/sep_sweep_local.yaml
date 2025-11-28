@@ -5,9 +5,10 @@ judge_model: Qwen/Qwen3-1.7B
 
 datasets:
   - trivia_qa
+  # - med_qa
 
 generation:
-  num_samples: 50          
+  num_samples: 10          
   num_generations: 10
   num_few_shot: 0
   temperature: 1.0
@@ -22,6 +23,8 @@ semantic_entropy:
   use_all_generations: true
 
 probes:
-  n_samples: 50              # match num_samples for simplicity
   entropy_key: cluster_assignment_entropy
   token_positions: [tbg, slt]
+  train_frac: 0.7     # 70% train
+  val_frac: 0.15      # 15% val
+  test_frac: 0.15
