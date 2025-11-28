@@ -9,15 +9,16 @@
 #SBATCH --output=/well/clifton/users/gar957/conformal-probes/slurm_logs/%x-%j.out
 #SBATCH --error=/well/clifton/users/gar957/conformal-probes/slurm_logs/%x-%j.err
 #SBATCH --signal=B:TERM@600
+#SBATCH --nodelist=compg[028-042]
 
 set -euo pipefail
 
-REPO_ROOT="/well/clifton/users/gar957conformal-probes"
+REPO_ROOT="/well/clifton/users/gar957/conformal-probes"
 CFG_YAML="${REPO_ROOT}/config/sep_sweep.yaml"
 
 module load Anaconda3
 eval "$(conda shell.bash hook)"
-conda activate "${REPO_ROOT}/conda_envs/sep_env"
+conda activate "${REPO_ROOT}/conda_envs/se_probes"
 
 export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-8}"
 export MKL_NUM_THREADS="${SLURM_CPUS_PER_TASK:-8}"

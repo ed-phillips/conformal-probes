@@ -7,7 +7,7 @@ set -euo pipefail
 # ---------- Config ----------
 PROJECT_NAME="conformal-probes"
 CONDA_ENV_NAME="se_probes"             # must match your YAML "name", but we use a prefix path
-ENV_FILE_NAME="sep_environment.yaml"   # your env file
+ENV_FILE_NAME="sep_env_312.yaml"   # your env file
 
 DATA_ROOT="${DATA:-/well/clifton/users/gar957}"
 PROJECT_DIR="${DATA_ROOT}/${PROJECT_NAME}"
