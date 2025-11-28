@@ -8,7 +8,7 @@ datasets:
   # - med_qa
 
 generation:
-  num_samples: 10          
+  num_samples: 100          
   num_generations: 10
   num_few_shot: 0
   temperature: 1.0
