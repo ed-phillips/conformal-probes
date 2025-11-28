@@ -43,6 +43,7 @@ def main():
                 "--model_max_new_tokens", str(gen.get("model_max_new_tokens", 50)),
                 "--metric", "hf_judge",
                 "--brief_prompt", gen.get("brief_prompt", "default"),
+                "--no-get_training_set_generations",
         
             ]
 
