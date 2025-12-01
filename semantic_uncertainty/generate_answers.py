@@ -18,6 +18,7 @@ from .compute_uncertainty_measures import main as main_compute
 
 utils.setup_logger()
 openai.api_key = os.getenv("OPENAI_API_KEY")  # Set up OpenAI API credentials.
+hf_token = os.getenv("HUGGING_FACE_HUB_TOKEN")  # Set up HuggingFace API credentials.
 
 
 def main(args):
