@@ -7,6 +7,15 @@ CFG_YAML="${REPO_ROOT}/config/sep_sweep_local.yaml"
 
 cd "${REPO_ROOT}"
 
+# Load .env file if it exists
+if [ -f "${REPO_ROOT}/.env" ]; then
+  # 'set -a' causes variables defined from now on to be automatically exported
+  set -a
+  source "${REPO_ROOT}/.env"
+  set +a
+  echo "Loaded variables from .env"
+fi
+
 # Activate the uv venv
 source .venv/bin/activate
 # Ensure repo root is in PYTHONPATH
