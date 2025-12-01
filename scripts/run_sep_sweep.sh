@@ -18,7 +18,13 @@ CFG_YAML="${REPO_ROOT}/config/sep_sweep.yaml"
 
 module load Anaconda3
 eval "$(conda shell.bash hook)"
+
+# Temporarily disable 'unbound variable' check because conda scripts are messy
+set +u
 conda activate "${REPO_ROOT}/conda_envs/se_probes"
+set -u
+
+export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-8}"
 
 export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-8}"
 export MKL_NUM_THREADS="${SLURM_CPUS_PER_TASK:-8}"
