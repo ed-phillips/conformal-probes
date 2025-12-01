@@ -1,11 +1,20 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Adjust to wherever you cloned it
-REPO_ROOT="/Users/edwardphillips/Documents/Oxford/Projects/conformal-probes"
+# Get the directory where this script is located (e.g., .../conformal-probes/scripts)
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+
+# Set REPO_ROOT to the parent directory (e.g., .../conformal-probes)
+REPO_ROOT="$(dirname "$SCRIPT_DIR")"
+
+# Define the config path relative to the root
 CFG_YAML="${REPO_ROOT}/config/sep_sweep_local.yaml"
 
+# Move to the root directory
 cd "${REPO_ROOT}"
+
+echo "Working directory set to: $(pwd)"
+echo "Config file located at: ${CFG_YAML}"
 
 # Load .env file if it exists
 if [ -f "${REPO_ROOT}/.env" ]; then
