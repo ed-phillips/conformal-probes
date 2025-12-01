@@ -93,8 +93,25 @@ def load_ds(dataset_name, seed, add_options=None):
         # http://participants-area.bioasq.org/datasets/ we are using training 11b
         # could also download from here https://zenodo.org/records/7655130
         # scratch_dir = os.getenv('SCRATCH_DIR', '.')
-        path = "~/uncertainty/data/bioasq/training11b.json"
-        with open(path, "rb") as file:
+         # Assumes script is run from the root 'conformal-probes' or one level deep
+        possible_paths = [
+            "data/bioasq/training11b.json",                  # If running from root
+            "../data/bioasq/training11b.json",               # If running from inner folder
+            os.path.expanduser("~/uncertainty/data/bioasq/training11b.json") # Legacy fallback
+        ]
+        
+        data_path = None
+        for p in possible_paths:
+            if os.path.exists(p):
+                data_path = p
+                break
+        
+        if data_path is None:
+            raise FileNotFoundError(f"Could not find BioASQ file in: {possible_paths}")
+
+        logging.info(f"Loading BioASQ from: {data_path}")
+        
+        with open(data_path, "rb") as file:
             data = json.load(file)
 
         questions = data["questions"]
@@ -198,7 +215,7 @@ def load_ds(dataset_name, seed, add_options=None):
         original_cols = dataset['train'].column_names
         train_dataset = dataset['train'].map(reformat, remove_columns=original_cols)
         validation_dataset = dataset['test'].map(reformat, remove_columns=original_cols)
-        
+
 
     return train_dataset, validation_dataset
 
