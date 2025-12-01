@@ -171,4 +171,36 @@ def load_ds(dataset_name, seed, add_options=None):
                 validation_dataset = datasets.Dataset.from_dict(dataset_dictionary)
                 logging.info('validation_dataset[0]: %s', validation_dataset[0])
 
+
+    elif dataset_name == 'medical_o1':
+        dataset = datasets.load_dataset("FreedomIntelligence/medical-o1-verifiable-problem")
+        
+        # 1. Create a validation split (e.g., 10% for validation)
+        dataset = dataset["train"].train_test_split(test_size=0.1, seed=seed)
+        
+        # 2. Define hashing for unique IDs (re-using logic from 'nq' block)
+        md5hash = lambda s: str(int(hashlib.md5(s.encode('utf-8')).hexdigest(), 16))
+
+        # 3. Define the reformat function
+        def reformat(example):
+            return {
+                'question': example['Open-ended Verifiable Question'],
+                'answers': {
+                    'text': [example['Ground-True Answer']], 
+                    'answer_start': [0]
+                },
+                'id': md5hash(example['Open-ended Verifiable Question']),
+                'context': ''  # No context provided in this dataset
+            }
+
+        # 4. Apply reformat and remove old columns to keep the schema clean
+        # We use .map() to process the dataset efficiently while keeping it as a Hugging Face Dataset object
+        original_cols = dataset['train'].column_names
+        train_dataset = dataset['train'].map(reformat, remove_columns=original_cols)
+        validation_dataset = dataset['test'].map(reformat, remove_columns=original_cols)
+        
+
     return train_dataset, validation_dataset
+
+
+    
