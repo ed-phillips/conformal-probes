@@ -190,7 +190,21 @@ class HuggingfaceModel(BaseModel):
             #   Qwen/Qwen2.5-7B-Instruct
             #   mistralai/Ministral-8B-Instruct-2410
             #   HuggingFaceTB/SmolLM3-3B-Instruct
-            model_id = model_name
+
+            # Transformers tries to ping the Hub to check for Mistral compatibility/config
+            # even in offline mode if given a repo ID.
+            # We explicitly resolve it to a local path (from cache) so Transformers treats it as a local file.
+            try:
+                if not os.path.exists(model_name):
+                    logging.info(f"Resolving {model_name} to local cache path for offline usage...")
+                    model_id = snapshot_download(repo_id=model_name, local_files_only=True)
+                    logging.info(f"Resolved to: {model_id}")
+                else:
+                    model_id = model_name
+            except Exception as e:
+                logging.warning(f"Could not resolve local path for {model_name}: {e}")
+                logging.warning("Falling back to original model string (this may fail if completely offline).")
+                model_id = model_name
 
             # For many “modern” models you *must* set trust_remote_code=True
             self.tokenizer = AutoTokenizer.from_pretrained(

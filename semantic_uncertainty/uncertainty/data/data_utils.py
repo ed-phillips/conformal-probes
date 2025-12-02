@@ -4,18 +4,41 @@ import os
 import json
 import hashlib
 import datasets
+from huggingface_hub import snapshot_download
+
+
+def load_dataset_offline(path_or_id, **kwargs):
+    """
+    Attempt to resolve the dataset ID to a local snapshot path (offline) 
+    before loading. If that fails (e.g. not in cache), fall back to standard load.
+    """
+    try:
+        # 1. Try to find the specific snapshot folder in the HF Cache (offline)
+        local_path = snapshot_download(
+            repo_id=path_or_id, 
+            repo_type="dataset", 
+            local_files_only=True
+        )
+        logging.info(f"Offline: Resolved dataset '{path_or_id}' to local path: {local_path}")
+        # 2. Load from that local directory
+        return datasets.load_dataset(local_path, **kwargs)
+    except Exception as e:
+        # 3. Fallback: If not cached or running locally with internet
+        logging.info(f"Offline resolution failed for '{path_or_id}' (Reason: {e}). Attempting standard online load.")
+        return datasets.load_dataset(path_or_id, **kwargs)
 
 
 def load_ds(dataset_name, seed, add_options=None):
     """Load dataset."""
     train_dataset, validation_dataset = None, None
+    
     if dataset_name == "squad":
-        dataset = datasets.load_dataset("squad_v2")
+        dataset = load_dataset_offline("squad_v2")
         train_dataset = dataset["train"]
         validation_dataset = dataset["validation"]
 
     elif dataset_name == 'svamp':
-        dataset = datasets.load_dataset('ChilleD/SVAMP')
+        dataset = load_dataset_offline('ChilleD/SVAMP')
 
         train_dataset = dataset["train"]
         validation_dataset = dataset["test"]
@@ -31,7 +54,7 @@ def load_ds(dataset_name, seed, add_options=None):
         validation_dataset = _validation_dataset + train_dataset
 
     elif dataset_name == 'nq':
-        dataset = datasets.load_dataset("nq_open")
+        dataset = load_dataset_offline("nq_open")
         train_dataset = dataset["train"]
         validation_dataset = dataset["validation"]
         md5hash = lambda s: str(int(hashlib.md5(s.encode('utf-8')).hexdigest(), 16))
@@ -47,14 +70,15 @@ def load_ds(dataset_name, seed, add_options=None):
         validation_dataset = [reformat(d) for d in validation_dataset]
 
     elif dataset_name == "trivia_qa":
-        dataset = datasets.load_dataset('TimoImhof/TriviaQA-in-SQuAD-format')['unmodified']
+        dataset = load_dataset_offline('TimoImhof/TriviaQA-in-SQuAD-format')['unmodified']
        
         dataset = dataset.train_test_split(test_size=0.2, seed=seed)
         train_dataset = dataset['train']
         validation_dataset = dataset['test']
     
     elif dataset_name == "med_qa":
-        dataset = datasets.load_dataset("bigbio/med_qa")
+        # Usually requires trust_remote_code=True for bigbio datasets
+        dataset = load_dataset_offline("bigbio/med_qa", trust_remote_code=True)
         logging.info('Dataset: %s', dataset)
         for key in 'train', 'validation':
             ids = ['train' + str(i) for i in range(len(dataset[key]))]
@@ -90,10 +114,7 @@ def load_ds(dataset_name, seed, add_options=None):
         validation_dataset = dataset["validation"]
 
     elif dataset_name == "bioasq":
-        # http://participants-area.bioasq.org/datasets/ we are using training 11b
-        # could also download from here https://zenodo.org/records/7655130
-        # scratch_dir = os.getenv('SCRATCH_DIR', '.')
-         # Assumes script is run from the root 'conformal-probes' or one level deep
+        # Assumes script is run from the root 'conformal-probes' or one level deep
         possible_paths = [
             "data/bioasq/training11b.json",                  # If running from root
             "../data/bioasq/training11b.json",               # If running from inner folder
@@ -190,7 +211,7 @@ def load_ds(dataset_name, seed, add_options=None):
 
 
     elif dataset_name == 'medical_o1':
-        dataset = datasets.load_dataset("FreedomIntelligence/medical-o1-verifiable-problem")
+        dataset = load_dataset_offline("FreedomIntelligence/medical-o1-verifiable-problem")
         
         # 1. Create a validation split (e.g., 10% for validation)
         dataset = dataset["train"].train_test_split(test_size=0.1, seed=seed)
@@ -211,13 +232,9 @@ def load_ds(dataset_name, seed, add_options=None):
             }
 
         # 4. Apply reformat and remove old columns to keep the schema clean
-        # We use .map() to process the dataset efficiently while keeping it as a Hugging Face Dataset object
         original_cols = dataset['train'].column_names
         train_dataset = dataset['train'].map(reformat, remove_columns=original_cols)
         validation_dataset = dataset['test'].map(reformat, remove_columns=original_cols)
 
 
     return train_dataset, validation_dataset
-
-
-    
