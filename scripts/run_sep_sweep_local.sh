@@ -39,9 +39,6 @@ mkdir -p "${HF_HOME}" "${HF_DATASETS_CACHE}"
 # Don’t talk to wandb servers
 export WANDB_MODE=offline
 
-# Optional: force CPU (in case any code tries to auto-select cuda)
-export CUDA_VISIBLE_DEVICES=""
-
 # Local runs root
 RUNS_ROOT="${REPO_ROOT}/runs_local"
 mkdir -p "${RUNS_ROOT}"
