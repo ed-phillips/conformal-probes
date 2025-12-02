@@ -8,7 +8,7 @@ judge_model: meta-llama/Llama-3.1-8B-Instruct
 
 datasets:
   - trivia_qa
-  - med_qa
+  # - med_qa
 
 generation:
   num_samples: 2000
@@ -26,7 +26,8 @@ semantic_entropy:
   use_all_generations: true
 
 probes:
-  n_samples: 2000             # cap per dataset
   entropy_key: cluster_assignment_entropy
   token_positions: [tbg, slt]
-  # later if you want: fixed-layer indices or ranges
+  train_frac: 0.7     # 70% train
+  val_frac: 0.15      # 15% val
+  test_frac: 0.15
