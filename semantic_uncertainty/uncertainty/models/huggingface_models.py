@@ -289,11 +289,27 @@ class HuggingfaceModel(BaseModel):
         if return_full:
             return full_answer
 
-        # For some models, we need to remove the input_data from the answer.
+        # 1. Try standard string startswith (fastest)
         if full_answer.startswith(input_data):
             input_data_offset = len(input_data)
         else:
-            raise ValueError('Have not tested this in a while.')
+            # 2. Fallback: Decode the exact input tokens to see what they look like
+            #    (handles whitespace/newline weirdness in Llama-3 tokenizer)
+            input_ids = inputs['input_ids'][0]
+            decoded_input = self.tokenizer.decode(input_ids, skip_special_tokens=True)
+            
+            if full_answer.startswith(decoded_input):
+                input_data_offset = len(decoded_input)
+            else:
+                # 3. Last resort: Trust the decoded token length.
+                #    If full_answer doesn't start with decoded_input, it might be due to 
+                #    special tokens at the boundary. We approximate.
+                logging.warning(
+                    f"Input string mismatch in predict(). Falling back to decoded token length.\n"
+                    f"Input start: {input_data[:50]}...\n"
+                    f"Full answer start: {full_answer[:50]}..."
+                )
+                input_data_offset = len(decoded_input)
 
         # Remove input from answer.
         answer = full_answer[input_data_offset:]
