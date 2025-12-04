@@ -32,7 +32,8 @@ class BaseEntailment:
 
 class EntailmentDeberta(BaseEntailment):
     def __init__(self):
-        self.tokenizer = AutoTokenizer.from_pretrained("microsoft/deberta-v2-xlarge-mnli")
+        self.tokenizer = AutoTokenizer.from_pretrained("microsoft/deberta-v2-xlarge-mnli",
+                                                       use_fast=False)
         self.model = AutoModelForSequenceClassification.from_pretrained(
             "microsoft/deberta-v2-xlarge-mnli").to(DEVICE)
 
