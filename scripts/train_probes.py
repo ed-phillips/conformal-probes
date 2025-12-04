@@ -19,27 +19,19 @@ class SEPData:
     slt_dataset: torch.Tensor
     entropy: torch.Tensor       # [N]
     accuracies: torch.Tensor    # [N]
+    b_entropy: torch.Tensor = None 
 
 
 def find_wandb_files_dir(run_dir: Path) -> Path | None:
-    """
-    Find the wandb offline run's `files/` directory under `run_dir`.
-
-    We try:
-      run_dir/<user>/uncertainty/wandb/latest-run/files
-      else: the most recent run_dir/**/offline-run-*/files
-    """
     user = os.environ.get("USER", "")
     base_wandb_root = run_dir / user / "uncertainty" / "wandb"
 
-    # 1) If latest-run symlink exists, prefer it
     latest = base_wandb_root / "latest-run"
     if latest.is_symlink() or latest.is_dir():
         files_dir = latest / "files"
         if files_dir.exists():
             return files_dir
 
-    # 2) Otherwise, search for offline-run-* dirs and pick the newest
     candidates = list(run_dir.rglob("offline-run-*"))
     if not candidates:
         return None
@@ -58,36 +50,44 @@ def load_sep_dataset(
     entropy_key: str,
     name: str,
 ) -> SEPData:
-    """
-    Load embeddings + entropy from explicit file paths (not assuming run_dir root).
-    """
     with val_path.open("rb") as f:
-        generations = pickle.load(f)
+        # Sort by key to ensure deterministic order regardless of dictionary insertion order
+        gen_dict = pickle.load(f)
+        # Python 3.7+ preserves order, but sorting by ID is safer for consistency
+        sorted_keys = sorted(gen_dict.keys())
+        generations = [gen_dict[k] for k in sorted_keys]
+
     with measures_path.open("rb") as f:
         measures = pickle.load(f)
 
+    # Entropy usually matches generation order if computed sequentially, 
+    # but strictly we assume the list in measures corresponds to the list in generations.
     entropy = torch.tensor(
         measures["uncertainty_measures"][entropy_key], dtype=torch.float32
     )
 
-    # Most likely answer correctness
     accuracies = torch.tensor(
-        [rec["most_likely_answer"]["accuracy"] for rec in generations.values()],
+        [rec["most_likely_answer"]["accuracy"] for rec in generations],
         dtype=torch.float32,
     )
 
-    # TBG: emb_last_tok_before_gen, SLT: emb_tok_before_eos
-    tbg = torch.stack(
-        [rec["most_likely_answer"]["emb_last_tok_before_gen"] for rec in generations.values()]
-    ).squeeze(-2).transpose(0, 1).to(torch.float32)
-    slt = torch.stack(
-        [rec["most_likely_answer"]["emb_tok_before_eos"] for rec in generations.values()]
-    ).squeeze(-2).transpose(0, 1).to(torch.float32)
+    # Extract Hidden States
+    # list of [Layers, 1, Dim]
+    tbg_raw = [rec["most_likely_answer"]["emb_last_tok_before_gen"] for rec in generations]
+    slt_raw = [rec["most_likely_answer"]["emb_tok_before_eos"] for rec in generations]
 
-    # truncate
+    # Stack -> [Batch, Layers, 1, Dim] -> Squeeze -> Transpose -> [Layers, Batch, Dim]
+    def process_emb(raw_list):
+        t = torch.stack(raw_list).squeeze(-2).transpose(0, 1).to(torch.float32)
+        return t
+
+    tbg = process_emb(tbg_raw)
+    slt = process_emb(slt_raw)
+
+    # Truncate
     n = min(n_samples, tbg.shape[1])
-    tbg = tbg[:, n * 0 : n, :]
-    slt = slt[:, n * 0 : n, :]
+    tbg = tbg[:, :n, :]
+    slt = slt[:, :n, :]
     entropy = entropy[:n]
     accuracies = accuracies[:n]
 
@@ -123,56 +123,71 @@ def binarize_entropy(entropy: torch.Tensor, thres: float) -> torch.Tensor:
     out[entropy > thres] = 1.0
     return out
 
+def get_split_indices(n_total, train_frac, val_frac, seed=42):
+    """
+    Generate deterministic indices for Train, Calibration (Val), and Test.
+    """
+    idxs = np.arange(n_total)
+    
+    # 1. Split (Train+Val) vs Test
+    # test_frac is the remainder
+    test_frac = 1.0 - (train_frac + val_frac)
+    if test_frac < 0: raise ValueError("train_frac + val_frac > 1.0")
+    
+    # We prioritize keeping train_frac exact? 
+    # Standard approach: split test off first.
+    train_val_idx, test_idx = train_test_split(
+        idxs, test_size=test_frac, random_state=seed
+    )
+    
+    # 2. Split Train vs Val (Calibration)
+    # The 'test_size' here is relative to the train_val chunk
+    # relative_val = val_frac / (train_frac + val_frac)
+    relative_val = val_frac / (1.0 - test_frac)
+    
+    train_idx, val_idx = train_test_split(
+        train_val_idx, test_size=relative_val, random_state=seed
+    )
+    
+    return train_idx, val_idx, test_idx
 
-def create_splits(datasets, scores):
-    X = np.array(datasets)  # [layers, N, d]
-    y = np.array(scores)
-    n_layers = X.shape[0]
 
-    X_trains, X_vals, X_tests, y_trains, y_vals, y_tests = [], [], [], [], [], []
-    for i in range(n_layers):
-        X_layer = X[i]
-        X_train_val, X_test, y_train_val, y_test = train_test_split(
-            X_layer, y, test_size=0.1, random_state=42
-        )
-        X_train, X_val, y_train, y_val = train_test_split(
-            X_train_val, y_train_val, test_size=0.2, random_state=42
-        )
-        X_trains.append(X_train)
-        X_vals.append(X_val)
-        X_tests.append(X_test)
-        y_trains.append(y_train)
-        y_vals.append(y_val)
-        y_tests.append(y_test)
-    return X_trains, X_vals, X_tests, y_trains, y_vals, y_tests
-
-
-def train_per_layer_probes(D: SEPData, token_type: str, metric: str):
-    if token_type == "tbg":
-        data = D.tbg_dataset
-    else:
-        data = D.slt_dataset
-
-    if metric == "entropy":
-        y = D.b_entropy.numpy()
-    elif metric == "accuracy":
-        y = D.accuracies.numpy()
-    else:
-        raise ValueError
-
-    X_trains, X_vals, X_tests, y_trains, y_vals, y_tests = create_splits(data, y)
+def train_per_layer_probes(dataset_tensor, y_target, idx_train, idx_val, idx_test):
+    """
+    Train a probe for every layer using the pre-computed indices.
+    """
+    # dataset_tensor: [Layers, N, Dim]
+    n_layers = dataset_tensor.shape[0]
+    
+    X = dataset_tensor.numpy()
+    y = y_target.numpy()
 
     aucs = []
     models = []
-    for Xt, Xv, Xte, yt, yv, yte in zip(
-        X_trains, X_vals, X_tests, y_trains, y_vals, y_tests
-    ):
+    
+    for i in range(n_layers):
+        X_layer = X[i]
+        
+        Xt = X_layer[idx_train]
+        yt = y[idx_train]
+        
+        Xte = X_layer[idx_test]
+        yte = y[idx_test]
+        
         clf = LogisticRegression(max_iter=1000)
         clf.fit(Xt, yt)
-        probs = clf.predict_proba(Xte)[:, 1]
-        auc = roc_auc_score(yte, probs)
+        
+        # Evaluate on Test for reporting
+        # (Note: In the paper pipeline, we use Val/Cal for conformal, Test for final)
+        if len(np.unique(yte)) > 1:
+            probs = clf.predict_proba(Xte)[:, 1]
+            auc = roc_auc_score(yte, probs)
+        else:
+            auc = 0.5
+            
         aucs.append(auc)
         models.append(clf)
+        
     return aucs, models
 
 
@@ -180,20 +195,29 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", type=str, required=True)
     ap.add_argument("--runs-root", type=str, required=True)
+    # Optional output override, defaults to inside the run dir
+    ap.add_argument("--out", type=str, default=None) 
     args = ap.parse_args()
 
     cfg = yaml.safe_load(Path(args.config).read_text())
     models = cfg["models"]
     datasets = cfg["datasets"]
+    
     probe_cfg = cfg.get("probes", {})
     n_samples = probe_cfg.get("n_samples", 2000)
     entropy_key = probe_cfg.get("entropy_key", "cluster_assignment_entropy")
+    
+    # Read split config
+    train_frac = probe_cfg.get("train_frac", 0.7)
+    val_frac = probe_cfg.get("val_frac", 0.15)
+    # Test is implicit remainder
 
     runs_root = Path(args.runs_root)
     all_Ds = []
     run_dirs = []
+    files_dirs = []
 
-    # 1) Load all datasets (robust to wandb layout)
+    # 1) Load all datasets
     for model in models:
         for ds in datasets:
             run_dir = runs_root / f"{Path(model).name}__{ds}"
@@ -202,16 +226,18 @@ def main():
                 continue
 
             files_dir = find_wandb_files_dir(run_dir)
+            if files_dir is None:
+                print(f"Skipping {run_dir}, no files dir")
+                continue
 
             val_path = files_dir / "validation_generations.pkl"
             unc_path = files_dir / "uncertainty_measures.pkl"
 
-            # val_path, unc_path = find_run_files(run_dir)
-            if val_path is None or unc_path is None:
-                print(f"Skipping {run_dir}, could not find both pickles")
+            if not val_path.exists() or not unc_path.exists():
+                print(f"Skipping {run_dir}, missing pickles")
                 continue
 
-            print(f"Loading SEP data from {val_path} and {unc_path}")
+            print(f"Loading {run_dir.name}")
             D = load_sep_dataset(
                 val_path=val_path,
                 measures_path=unc_path,
@@ -221,50 +247,80 @@ def main():
             )
             all_Ds.append(D)
             run_dirs.append(run_dir)
+            files_dirs.append(files_dir)
 
     if not all_Ds:
-        raise RuntimeError("No valid runs found with both generations + uncertainty_measures.")
+        raise RuntimeError("No valid runs found.")
 
-    # 2) Global best split for entropy (across all runs)
+    # 2) Global best split for entropy
     all_entropy = torch.cat([D.entropy for D in all_Ds], dim=0)
-    split = best_split(all_entropy)
-    print("Best universal split:", split)
+    split_val = best_split(all_entropy)
+    print(f"Best universal entropy split value: {split_val}")
 
     for D in all_Ds:
-        D.b_entropy = binarize_entropy(D.entropy, split)
-        dummy_acc = max(D.b_entropy.mean().item(), 1 - D.b_entropy.mean().item())
-        print(f"Dummy accuracy {D.name}: {dummy_acc:.4f}")
+        D.b_entropy = binarize_entropy(D.entropy, split_val)
 
-    # 3) Train probes per dataset and save per-run probes.pkl
+    # 3) Train and Save
     global_results = {}
-    for D, run_dir in zip(all_Ds, run_dirs):
+    
+    for D, files_dir in zip(all_Ds, files_dirs):
         print(f"Training probes for {D.name}")
-        global_results[D.name] = {}
+        
+        # A. Create Splits ONCE
+        n_total = len(D.accuracies)
+        idx_train, idx_val, idx_test = get_split_indices(n_total, train_frac, val_frac)
+        
+        print(f"  Splits: Train={len(idx_train)}, Val={len(idx_val)}, Test={len(idx_test)}")
+        
+        res = {}
+        
+        # Save indices so notebook uses exactly the same rows
+        res["splits"] = {
+            "train": idx_train,
+            "val": idx_val,
+            "test": idx_test
+        }
 
-        # SE probes
-        tb_auc, tb_models = train_per_layer_probes(D, "tbg", "entropy")
-        sb_auc, sb_models = train_per_layer_probes(D, "slt", "entropy")
+        # B. Train SE Probes (Target = binarized entropy)
+        tb_auc, tb_models = train_per_layer_probes(
+            D.tbg_dataset, D.b_entropy, idx_train, idx_val, idx_test
+        )
+        sb_auc, sb_models = train_per_layer_probes(
+            D.slt_dataset, D.b_entropy, idx_train, idx_val, idx_test
+        )
 
-        # Accuracy probes
-        ta_auc, ta_models = train_per_layer_probes(D, "tbg", "accuracy")
-        sa_auc, sa_models = train_per_layer_probes(D, "slt", "accuracy")
+        # C. Train Accuracy Probes (Target = accuracy)
+        # Note: We usually train to predict Correctness (1.0). 
+        # Notebook handles inversion to P(Hallucination).
+        ta_auc, ta_models = train_per_layer_probes(
+            D.tbg_dataset, D.accuracies, idx_train, idx_val, idx_test
+        )
+        sa_auc, sa_models = train_per_layer_probes(
+            D.slt_dataset, D.accuracies, idx_train, idx_val, idx_test
+        )
 
-        global_results[D.name]["tb_aucs"] = tb_auc
-        global_results[D.name]["sb_aucs"] = sb_auc
-        global_results[D.name]["ta_aucs"] = ta_auc
-        global_results[D.name]["sa_aucs"] = sa_auc
-        global_results[D.name]["tb_models"] = tb_models
-        global_results[D.name]["sb_models"] = sb_models
-        global_results[D.name]["ta_models"] = ta_models
-        global_results[D.name]["sa_models"] = sa_models
+        res["tb_aucs"] = tb_auc
+        res["sb_aucs"] = sb_auc
+        res["ta_aucs"] = ta_auc
+        res["sa_aucs"] = sa_auc
+        
+        res["tb_models"] = tb_models
+        res["sb_models"] = sb_models
+        res["ta_models"] = ta_models
+        res["sa_models"] = sa_models
 
-        # --- per-run probes file ---
+        global_results[D.name] = res
+
+        # Save per-run probes.pkl
+        # Note: If --out is passed, we might overwrite, but usually we want per-run files.
+        # The script arg --out is usually for a global file, but here we save per run.
         per_run_out = files_dir / "probes.pkl"
         with per_run_out.open("wb") as f:
-            pickle.dump({"split": split, "results": {D.name: global_results[D.name]}}, f)
-        print(f"Saved probes for {D.name} to {per_run_out}")
-
-
+            pickle.dump({
+                "split_threshold": split_val, 
+                "results": {D.name: res}
+            }, f)
+        print(f"  Saved to {per_run_out}")
 
 if __name__ == "__main__":
     main()
