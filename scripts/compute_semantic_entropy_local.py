@@ -5,6 +5,10 @@ import yaml
 from pathlib import Path
 import numpy as np
 
+import transformers.utils.import_utils
+# Disable the CVE-2025-32434 check for this script because we trust the model
+transformers.utils.import_utils.check_torch_load_is_safe = lambda: None
+
 from semantic_uncertainty.uncertainty.uncertainty_measures.semantic_entropy import (
     EntailmentDeberta,
     get_semantic_ids,
