@@ -233,7 +233,7 @@ def model_based_metric(predicted_answer, example, model):
         return 0.0
     else:
         logging.warning('Redo llm check.')
-        predicted_answer = model.predict(prompt, 1)
+        predicted_answer, _, _ = model.predict(prompt, 1)
         if 'yes' in predicted_answer.lower():
             return 1.0
         elif 'no' in predicted_answer.lower():
