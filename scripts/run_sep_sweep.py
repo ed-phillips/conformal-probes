@@ -9,10 +9,16 @@ def main():
     p.add_argument("--config", type=str, required=True)
     p.add_argument("--runs-root", type=str, required=True)
     p.add_argument("--no-compute-uncertainties", action="store_true")
+    p.add_argument("--model", type=str, default=None, help="Run specific model only")
     args = p.parse_args()
 
     cfg = yaml.safe_load(Path(args.config).read_text())
-    models = cfg["models"]
+    # FILTER MODELS
+    if args.model:
+        print(f"Filtering config to single model: {args.model}")
+        models = [args.model]
+    else:
+        models = cfg["models"]
     datasets = cfg["datasets"]
     gen = cfg.get("generation", {})
 

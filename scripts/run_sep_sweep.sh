@@ -54,26 +54,43 @@ echo "RUNS_ROOT: ${RUNS_ROOT}"
 echo "HF_HOME: ${HF_HOME}"
 echo "HF_DATASETS_CACHE: ${HF_DATASETS_CACHE}"
 
-# 1) Generate answers (no compute_uncertainties inside generate_answers)
-python scripts/run_sep_sweep.py \
-  --config "${CFG_YAML}" \
-  --runs-root "${RUNS_ROOT}" \
+# --- Build Arguments ---
+# Base arguments for the generation script
+GEN_ARGS=(
+  --config "${CFG_YAML}"
+  --runs-root "${RUNS_ROOT}"
   --no-compute-uncertainties
+)
 
-# 2) Compute semantic entropy locally (offline)
+# Optional: If TARGET_MODEL is set (via export), append it.
+# The ':-' ensures it doesn't crash on 'set -u' if unset.
+if [[ -n "${TARGET_MODEL:-}" ]]; then
+    echo ">>> Target Set: Processing Single Model: ${TARGET_MODEL}"
+    GEN_ARGS+=(--model "${TARGET_MODEL}")
+else
+    echo ">>> Target Unset: Processing ALL Models from Config"
+fi
+
+# 1) Generate answers
+# If TARGET_MODEL is set, this only generates for that model.
+python scripts/run_sep_sweep.py "${GEN_ARGS[@]}"
+
+# 2) Compute semantic entropy
+# This script iterates the config list, but skips directories that don't exist.
+# So it naturally handles single-model runs without needing extra flags.
 python scripts/compute_semantic_entropy_local.py \
   --config "${CFG_YAML}" \
   --runs-root "${RUNS_ROOT}"
 
-# 3) Train probes (replaces notebook)
+# 3) Train probes
+# Same here: it processes whatever valid data it finds in RUNS_ROOT.
 python scripts/train_probes.py \
   --config "${CFG_YAML}" \
-  --runs-root "${RUNS_ROOT}" \
-  --out "${RUNS_ROOT}/probes.pkl"
+  --runs-root "${RUNS_ROOT}" 
 
-# Sync back to NFS
+# Sync results
 OUT_ROOT="${REPO_ROOT}/outputs/runs/${SLURM_JOB_ID}"
 mkdir -p "${OUT_ROOT}"
 rsync -avh --no-g --no-p "${RUNS_ROOT}/" "${OUT_ROOT}/"
 
-echo "All done. Results synced to: ${OUT_ROOT}"
+echo "Done."
