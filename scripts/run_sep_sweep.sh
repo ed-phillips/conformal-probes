@@ -24,7 +24,8 @@ set +u
 conda activate "${REPO_ROOT}/conda_envs/se_probes"
 set -u
 
-export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-8}"
+# Add the repository root to PYTHONPATH so scripts can import 'semantic_uncertainty'
+export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
 
 export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-8}"
 export MKL_NUM_THREADS="${SLURM_CPUS_PER_TASK:-8}"
