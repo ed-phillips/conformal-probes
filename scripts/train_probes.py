@@ -10,8 +10,6 @@ import yaml
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
-from sklearn.pipeline import make_pipeline
 
 
 @dataclass
@@ -176,23 +174,15 @@ def train_per_layer_probes(dataset_tensor, y_target, idx_train, idx_val, idx_tes
         Xte = X_layer[idx_test]
         yte = y[idx_test]
         
-        clf = make_pipeline(
-            StandardScaler(),
-            LogisticRegression(max_iter=5000, solver='lbfgs', C=1.0) 
-        )
+        clf = LogisticRegression(max_iter=1000)
+        clf.fit(Xt, yt)
         
-        try:
-            clf.fit(Xt, yt)
-            
-            # Evaluate
-            if len(np.unique(yte)) > 1:
-                # predict_proba on pipeline automatically applies scaling
-                probs = clf.predict_proba(Xte)[:, 1]
-                auc = roc_auc_score(yte, probs)
-            else:
-                auc = 0.5
-        except Exception as e:
-            print(f"Probe training failed at layer {i}: {e}")
+        # Evaluate on Test for reporting
+        # (Note: In the paper pipeline, we use Val/Cal for conformal, Test for final)
+        if len(np.unique(yte)) > 1:
+            probs = clf.predict_proba(Xte)[:, 1]
+            auc = roc_auc_score(yte, probs)
+        else:
             auc = 0.5
             
         aucs.append(auc)
