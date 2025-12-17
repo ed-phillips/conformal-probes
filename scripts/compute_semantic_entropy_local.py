@@ -99,7 +99,11 @@ def main():
             }
             validation_is_false = []
 
-            for tid, ex in enumerate(validation_generations.values()):
+            # sort keys to ensure deterministic order matching train_probes.p
+            sorted_ids = sorted(validation_generations.keys())
+
+            for tid in sorted_ids:
+                ex = validation_generations[tid]
                 question = ex["question"]
                 context = ex["context"]
                 full_responses = ex["responses"]
