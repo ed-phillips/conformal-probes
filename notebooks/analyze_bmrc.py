@@ -929,32 +929,34 @@ def write_conformal_tables_pretty(
         # Helper: pick bolding winners for a given model+alpha
         def compute_bold_winners(df_block: pd.DataFrame, alpha: float) -> Dict[str, Optional[str]]:
             """
-            df_block has rows for one (model, alpha) with columns Method, Coverage, Realized.
-            Returns:
-              {
-                "best_cov_method": <method or None>,
-                "best_risk_method": <method or None>
-              }
+            df_block: rows for one (model, alpha) with columns Method, Coverage, Realized.
+            Returns method to bold for coverage and risk.
             """
             b = df_block.dropna(subset=["Coverage", "Realized"]).copy()
-            eligible = b[b["Realized"] <= alpha].copy()
-            if eligible.empty:
+            if b.empty:
                 return {"best_cov_method": None, "best_risk_method": None}
 
-            # Best coverage among eligible; tie-break by higher realized risk (closer to alpha), then method order.
-            eligible["method_rank"] = eligible["Method"].map(method_order).fillna(9999).astype(int)
-            elig_cov = eligible.sort_values(
-                ["Coverage", "Realized", "method_rank"],
-                ascending=[False, False, True],
-            )
-            best_cov_method = elig_cov.iloc[0]["Method"]
+            b["method_rank"] = b["Method"].map(method_order).fillna(9999).astype(int)
 
-            # Best (closest below alpha) risk among eligible; tie-break by higher coverage, then method order.
-            elig_risk = eligible.sort_values(
-                ["Realized", "Coverage", "method_rank"],
-                ascending=[False, False, True],
+            # Coverage bold: max coverage among those meeting risk <= alpha
+            eligible = b[b["Realized"] <= alpha].copy()
+            if eligible.empty:
+                best_cov_method = None
+            else:
+                # tie-break: higher realized risk (closer to alpha), then method order
+                eligible = eligible.sort_values(
+                    ["Coverage", "Realized", "method_rank"],
+                    ascending=[False, False, True],
+                )
+                best_cov_method = eligible.iloc[0]["Method"]
+
+            # Risk bold: closest to alpha (over/under), tie-break by higher coverage, then method order
+            b["abs_gap"] = (b["Realized"] - alpha).abs()
+            b = b.sort_values(
+                ["abs_gap", "Coverage", "method_rank"],
+                ascending=[True, False, True],
             )
-            best_risk_method = elig_risk.iloc[0]["Method"]
+            best_risk_method = b.iloc[0]["Method"]
 
             return {"best_cov_method": best_cov_method, "best_risk_method": best_risk_method}
 
