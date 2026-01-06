@@ -76,7 +76,7 @@ METHOD_ORDER = [
     "SE Probe",
     "Combined (LR)",
     "Combined (MLP)",
-    "Combined (GBM)"
+    # "Combined (GBM)"
 ]
 
 # -----------------------------
@@ -395,15 +395,30 @@ def plot_detection_bars(df_det, figures_dir):
             plt.savefig(figures_dir / f"detection_{safe_model}_{subset}.png", dpi=300)
             plt.close()
 
-def plot_risk_coverage(curve_data, figures_dir):
+def plot_risk_coverage(curve_data, figures_dir, base_risks):
+    """
+    Plots RC curves with dynamic limits and an 'Ideal' oracle line.
+    base_risks: dict mapping (model, dataset) -> float (base hallucination rate)
+    """
     for model, dsets in curve_data.items():
         for ds, methods in dsets.items():
             plt.figure(figsize=(8, 6))
             
-            # Track max risk for dynamic ylim
-            max_r = 0.0
+            # 1. Plot Ideal Oracle
+            # Ideal: Risk is 0 until coverage = (1 - base_risk), then rises to base_risk
+            base_risk = base_risks.get((model, ds), 0.5)
+            max_safe_cov = 1.0 - base_risk
+            
+            ideal_x = [0, max_safe_cov, 1.0]
+            ideal_y = [0, 0, base_risk]
+            
+            plt.plot(ideal_x, ideal_y, linestyle="--", color="black", 
+                     label="Ideal (Oracle)", alpha=0.6, linewidth=1.5)
+            
+            # 2. Plot Methods
+            max_r = base_risk # Start max tracking at base risk
             for m_name, (cov, risk) in methods.items():
-                if "GBM" in m_name: continue # Optional: Hide GBM to de-clutter
+                if "GBM" in m_name: continue
                 plt.plot(cov, risk, label=m_name, color=COLORS.get(m_name, "black"), linewidth=2.5)
                 if risk:
                     max_r = max(max_r, max(risk))
@@ -413,7 +428,8 @@ def plot_risk_coverage(curve_data, figures_dir):
             plt.title(f"Risk-Coverage: {model} / {ds}")
             plt.legend()
             plt.xlim(0, 1)
-            # Dynamic Y-Limit (cap at 1.0)
+            
+            # Dynamic Y: Show enough to see the base risk + a bit of margin
             top_lim = min(1.0, max_r * 1.15) if max_r > 0 else 1.0
             plt.ylim(0, top_lim)
             plt.grid(True, alpha=0.3)
@@ -567,6 +583,175 @@ def plot_calibration_curves(df_cal, figures_dir):
 def latex_escape(s):
     return str(s).replace("_", r"\_").replace("%", r"\%")
 
+def write_auroc_table(df_det, figures_dir):
+    """
+    Generates a LaTeX table summarizing AUROC.
+    Rows: Models -> Methods
+    Cols: Datasets -> (Full, Confident)
+    """
+    # Filter to desired methods only
+    df = df_det[df_det["Method"].isin(METHOD_ORDER)].copy()
+    if df.empty: return
+
+    datasets = sorted(df["Dataset"].unique())
+    models = sorted(df["Model"].unique())
+
+    # Pre-calculate winners for bolding
+    # Key: (Model, Dataset, Subset) -> Value: Max AUROC
+    winners = {}
+    for model in models:
+        for ds in datasets:
+            for subset in ["Full", "Confident"]:
+                subset_data = df[
+                    (df["Model"] == model) & 
+                    (df["Dataset"] == ds) & 
+                    (df["Subset"] == subset)
+                ]
+                if not subset_data.empty:
+                    winners[(model, ds, subset)] = subset_data["AUROC"].max()
+                else:
+                    winners[(model, ds, subset)] = -1.0
+
+    lines = []
+    
+    # ------------------
+    # Table Header
+    # ------------------
+    # Columns: Method + (Full, Conf) * N_Datasets
+    col_spec = "l" + "cc" * len(datasets)
+    lines.append(rf"\begin{{tabular}}{{{col_spec}}}")
+    lines.append(r"\toprule")
+
+    # Row 1: Dataset Names
+    header_1 = [r"\textbf{Method}"]
+    for ds in datasets:
+        ds_name = latex_escape(ds).replace(" ", r"~") # Prevent wrapping if possible
+        header_1.append(rf"\multicolumn{{2}}{{c}}{{\textbf{{{ds_name}}}}}")
+    lines.append(" & ".join(header_1) + r" \\")
+
+    # Row 2: Subset Names
+    header_2 = [r""] # Empty cell under Method
+    for _ in datasets:
+        header_2.extend([r"\scriptsize{Full}", r"\scriptsize{Conf}"])
+    lines.append(" & ".join(header_2) + r" \\")
+    lines.append(r"\midrule")
+
+    # ------------------
+    # Table Body
+    # ------------------
+    for model in models:
+        # Section Header for Model
+        model_name = latex_escape(model)
+        lines.append(rf"\multicolumn{{{1 + 2*len(datasets)}}}{{l}}{{\textbf{{{model_name}}}}} \\")
+        
+        for method in METHOD_ORDER:
+            row = [latex_escape(method)]
+            
+            for ds in datasets:
+                # Get Full Value
+                val_full_series = df[(df["Model"] == model) & (df["Dataset"] == ds) & (df["Method"] == method) & (df["Subset"] == "Full")]["AUROC"]
+                val_full = val_full_series.iloc[0] if not val_full_series.empty else 0.0
+                
+                # Get Confident Value
+                val_conf_series = df[(df["Model"] == model) & (df["Dataset"] == ds) & (df["Method"] == method) & (df["Subset"] == "Confident")]["AUROC"]
+                val_conf = val_conf_series.iloc[0] if not val_conf_series.empty else 0.0
+
+                # Format strings
+                s_full = f"{val_full:.3f}"
+                s_conf = f"{val_conf:.3f}"
+
+                # Apply Bolding (Comparison with tolerance)
+                best_full = winners.get((model, ds, "Full"), -1)
+                best_conf = winners.get((model, ds, "Confident"), -1)
+
+                if val_full >= best_full - 1e-6:
+                    s_full = rf"\textbf{{{s_full}}}"
+                
+                if val_conf >= best_conf - 1e-6:
+                    s_conf = rf"\textbf{{{s_conf}}}"
+
+                row.extend([s_full, s_conf])
+
+            lines.append(" & ".join(row) + r" \\")
+        
+        lines.append(r"\addlinespace")
+
+    lines.append(r"\bottomrule")
+    lines.append(r"\end{tabular}")
+
+    out_path = figures_dir / "detection_auroc_table.tex"
+    with open(out_path, "w") as f:
+        f.write("\n".join(lines))
+
+
+def write_aurc_table(df_aurc, figures_dir):
+    """
+    Generates LaTeX table for AURC (Area Under Risk-Coverage).
+    Lower is Better.
+    """
+    # Filter methods
+    df = df_aurc[df_aurc["Method"].isin(METHOD_ORDER)].copy()
+    if df.empty: return
+
+    datasets = sorted(df["Dataset"].unique())
+    models = sorted(df["Model"].unique())
+
+    # Pre-calculate Winners (Min AURC)
+    winners = {}
+    for model in models:
+        for ds in datasets:
+            subset_data = df[(df["Model"] == model) & (df["Dataset"] == ds)]
+            if not subset_data.empty:
+                winners[(model, ds)] = subset_data["AURC"].min()
+            else:
+                winners[(model, ds)] = 100.0
+
+    lines = []
+    
+    # Header
+    col_spec = "l" + "c" * len(datasets)
+    lines.append(rf"\begin{{tabular}}{{{col_spec}}}")
+    lines.append(r"\toprule")
+
+    header = [r"\textbf{Method}"] + [rf"\textbf{{{latex_escape(ds)}}}" for ds in datasets]
+    lines.append(" & ".join(header) + r" \\")
+    lines.append(r"\midrule")
+
+    # Body
+    for model in models:
+        lines.append(rf"\multicolumn{{{1 + len(datasets)}}}{{l}}{{\textbf{{{latex_escape(model)}}}}} \\")
+        
+        for method in METHOD_ORDER:
+            row = [latex_escape(method)]
+            
+            for ds in datasets:
+                val_series = df[(df["Model"] == model) & (df["Dataset"] == ds) & (df["Method"] == method)]["AURC"]
+                
+                if val_series.empty:
+                    row.append("-")
+                else:
+                    val = val_series.iloc[0]
+                    # AURC is often small, maybe multiply by 100 or keep as is? 
+                    # Usually 3 decimal places is fine.
+                    s_val = f"{val:.3f}"
+                    
+                    # Bold if Minimal (Lower is Better)
+                    best = winners.get((model, ds), 100.0)
+                    if val <= best + 1e-6:
+                        s_val = rf"\textbf{{{s_val}}}"
+                    
+                    row.append(s_val)
+            
+            lines.append(" & ".join(row) + r" \\")
+        lines.append(r"\addlinespace")
+
+    lines.append(r"\bottomrule")
+    lines.append(r"\end{tabular}")
+
+    with open(figures_dir / "aurc_summary_table.tex", "w") as f:
+        f.write("\n".join(lines))
+
+
 def write_conformal_tables(df_cal, figures_dir, table_alphas):
     df = df_cal.copy()
     df["Target"] = df["Target"].round(3)
@@ -663,6 +848,8 @@ def main():
     cal_results = []
     layer_results_list = []
     curve_data = {} 
+    aurc_results = []
+    base_risks = {} # Store base risk per (model, dataset) for the Ideal curve
 
     print(f"Scanning {runs_root}...")
 
@@ -682,13 +869,13 @@ def main():
                 X, y, se = extract_features_aligned(*pickles, embedding_key="emb_last_tok_before_gen")
                 df, l_stats, splits = process_model_dataset(X, y, se, seed=42)
                 
-                # --- DEBUG CHECK ---
-                cal_df = df[df["split"] == "cal"]
-                cal_risk = cal_df["y_hall"].mean()
-                print(f"  [Info] Calibration set size: {len(cal_df)}, Hallucination Rate: {cal_risk:.3f}")
-                if cal_risk == 0.0 or cal_risk == 1.0:
-                    print("  [Warning] Calibration risk is 0 or 1. Conformal prediction may fail to find thresholds.")
-                # -------------------
+                # # --- DEBUG CHECK ---
+                # cal_df = df[df["split"] == "cal"]
+                # cal_risk = cal_df["y_hall"].mean()
+                # print(f"  [Info] Calibration set size: {len(cal_df)}, Hallucination Rate: {cal_risk:.3f}")
+                # if cal_risk == 0.0 or cal_risk == 1.0:
+                #     print("  [Warning] Calibration risk is 0 or 1. Conformal prediction may fail to find thresholds.")
+                # # -------------------
                 
             except Exception as e:
                 print(f"  Failed: {e}")
@@ -720,6 +907,10 @@ def main():
             df_test = df[df["split"] == "test"].copy()
             df_conf = df_test[df_test["se_raw"] <= df_test["se_raw"].quantile(0.3)].copy()
 
+            # Store base risk for plotting Ideal line later
+            # (Just grab it once per dataset)
+            base_risks[(safe_model, dataset_name)] = df_test["y_hall"].mean()
+
             for m_name, col in method_map.items():
                 # AUROC
                 try:
@@ -739,6 +930,16 @@ def main():
                 covs, risks = get_risk_coverage_curve(df_test, col)
                 curve_data[safe_model][dataset_name][m_name] = (covs, risks)
 
+                # Integrating Risk w.r.t Coverage.
+                # Ensure sorted by coverage for integration (get_risk_coverage_curve returns sorted covs)
+                # We use trapezoidal rule.
+                # AURC = Area under curve. Lower is better.
+                aurc_val = np.trapezoid(risks, covs)
+                aurc_results.append({
+                    "Model": safe_model, "Dataset": dataset_name, 
+                    "Method": m_name, "AURC": aurc_val
+                })
+
                 # Conformal Calibration
                 # Use a dense grid for smooth plots (0.5% to 40% risk)
                 dense_alphas = np.linspace(0.005, 0.4, 40)
@@ -753,6 +954,8 @@ def main():
                         "Model": safe_model, "Dataset": dataset_name, "Method": m_name,
                         "Target": float(alpha), "Realized": r, "Coverage": c
                     })
+            
+            
 
             plot_decision_boundary(
                 df, safe_model, dataset_name, alpha=0.1, delta=args.delta, 
@@ -765,15 +968,20 @@ def main():
     df_cal = pd.DataFrame(cal_results)
     df_det.to_csv(figures_dir / "auroc_summary.csv", index=False)
     df_cal.to_csv(figures_dir / "calibration_summary.csv", index=False)
+    # Save AURC CSV
+    df_aurc = pd.DataFrame(aurc_results)
+    df_aurc.to_csv(figures_dir / "aurc_summary.csv", index=False)
 
     print("Generating Plots...")
     plot_detection_bars(df_det, figures_dir)
     plot_layer_sensitivity(layer_results_list, figures_dir)
-    plot_risk_coverage(curve_data, figures_dir)
+    plot_risk_coverage(curve_data, figures_dir, base_risks)
     plot_calibration_curves(df_cal, figures_dir)
     
     print("Generating Tables...")
-    write_conformal_tables(df_cal, figures_dir, [0.01, 0.05, 0.1])
+    write_conformal_tables(df_cal, figures_dir, [0.05, 0.1, 0.2, 0.25])
+    write_auroc_table(df_det, figures_dir)
+    write_aurc_table(df_aurc, figures_dir)
     
     print(f"Done! Artifacts saved to: {figures_dir}")
 
