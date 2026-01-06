@@ -945,7 +945,7 @@ def main():
                 dense_alphas = np.linspace(0.005, 0.4, 40)
                 
                 # Ensure we include the specific table alphas so they aren't interpolated
-                table_alphas = np.array([0.01, 0.05, 0.1, 0.2])
+                table_alphas = np.array([0.05, 0.1, 0.2, 0.25])
                 all_alphas = np.unique(np.sort(np.concatenate([dense_alphas, table_alphas])))
 
                 for alpha in all_alphas:
