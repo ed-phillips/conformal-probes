@@ -64,6 +64,9 @@ def main():
             if args.no_compute_uncertainties:
                 cmd.append("--no-compute_uncertainties")
 
+            # don't bother with judge for high temp
+            cmd.append("--no-compute_accuracy_at_all_temps")
+
             # Inherit current env & override SCRATCH_DIR for this run
             env = os.environ.copy()
             env["SCRATCH_DIR"] = str(run_dir)
