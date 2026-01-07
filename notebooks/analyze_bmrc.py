@@ -1,19 +1,24 @@
 #!/usr/bin/env python3
 """
-analyze_results.py
+analyze_results.py (3-way + CV aligned)
 
-End-to-end analysis + plotting for Hallucination Detection.
+Reads per-run trained probes + splits from probes.pkl (produced by the 3-way + CV train_probes.py),
+then produces paper figures/tables:
 
-Features:
-- Hallucination Detection AUROC (Bar Charts per Model).
-- Layer Sensitivity Analysis.
-- Risk-Coverage Curves (Dynamic Y-limits).
-- Decision Boundary Visualization.
-- 1D Conformal Risk Control (LR, MLP, GBM).
-- LaTeX Table Generation.
+- Hallucination Detection AUROC (Full + Confident subset) bar charts
+- Layer sensitivity plots (from CV AUCs saved in probes.pkl)
+- Risk–Coverage curves (+ Ideal oracle line)
+- AURC (area under risk–coverage) CSV + LaTeX
+- 1D "calibration" curves (target alpha vs realized risk on test) using the calibration split
+- Decision boundary visualization in (p_correct, p_high_entropy) space using the SAME fitted combiner model
+
+Conventions:
+- y_hall = 1 means hallucination/incorrect, y_hall = 0 correct.
+- Risk scores: higher = more risky, lower = safer.
+- Thresholding accepts if score <= t.
 
 Usage:
-  python analyze_results.py --runs-root /path/to/runs
+  python analyze_results.py --runs-root /path/to/runs --figures-dirname analysis_output_v4
 """
 
 import os
@@ -21,6 +26,7 @@ import argparse
 import pickle
 from pathlib import Path
 from typing import Dict, Tuple, Optional, List, Any
+import subprocess
 
 import numpy as np
 import pandas as pd
@@ -35,6 +41,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.neural_network import MLPClassifier
 from sklearn.ensemble import GradientBoostingClassifier
 from sklearn.metrics import roc_auc_score
+
 
 # -----------------------------
 # Configuration
@@ -57,17 +64,17 @@ DEFAULT_TARGET_DATASETS = [
     "medical_o1",
 ]
 
-# Plotting Aesthetics
+# Plotting aesthetics
 sns.set_theme(style="whitegrid", context="paper", font_scale=1.4)
 plt.rcParams["font.family"] = "serif"
 
 COLORS = {
-    "Semantic Entropy": "#7f8c8d",          # Grey
-    "Accuracy Probe": "#3498db",            # Blue
-    "SE Probe": "#e67e22",                  # Orange
-    "Combined (LR)": "#2ecc71",             # Green
-    "Combined (MLP)": "#9b59b6",            # Purple
-    "Combined (GBM)": "#e74c3c",            # Red
+    "Semantic Entropy": "#7f8c8d",
+    "Accuracy Probe": "#3498db",
+    "SE Probe": "#e67e22",
+    "Combined (LR)": "#2ecc71",
+    "Combined (MLP)": "#9b59b6",
+    "Combined (GBM)": "#e74c3c",
 }
 
 METHOD_ORDER = [
@@ -76,8 +83,9 @@ METHOD_ORDER = [
     "SE Probe",
     "Combined (LR)",
     "Combined (MLP)",
-    # "Combined (GBM)"
+    # "Combined (GBM)",
 ]
+
 
 # -----------------------------
 # Utilities: Paths & Loading
@@ -91,427 +99,416 @@ def resolve_paths(args_runs_root: str) -> Tuple[Path, Path]:
         runs_path = repo_root / runs_path
     return repo_root, runs_path
 
+
 def find_run_directory(root_path: Path, model_name: str, dataset_name: str) -> Optional[Path]:
     safe_model_name = Path(model_name).name
     target_folder_name = f"{safe_model_name}__{dataset_name}"
-    candidates = []
-    
+    candidates: List[Path] = []
+
     if root_path.exists():
         flat_path = root_path / target_folder_name
         if flat_path.exists():
             candidates.append(flat_path)
+
         for p in root_path.iterdir():
             if p.is_dir():
                 nested_path = p / target_folder_name
                 if nested_path.exists():
                     candidates.append(nested_path)
-    
+
     if not candidates:
         return None
     return sorted(candidates, key=lambda p: p.stat().st_mtime, reverse=True)[0]
 
-def load_pickles(run_dir: Path) -> Optional[Tuple[dict, dict]]:
+
+def find_wandb_files_dir(run_dir: Path) -> Path:
+    """
+    Mirrors your other scripts: prefer run_dir/files, else search for newest .../files.
+    """
     files_dir = run_dir / "files"
-    if not files_dir.exists():
-        candidates = list(run_dir.rglob("files"))
-        if candidates:
-            files_dir = sorted(candidates, key=lambda p: p.stat().st_mtime)[-1]
-        else:
-            files_dir = run_dir
+    if files_dir.exists():
+        return files_dir
+    candidates = list(run_dir.rglob("files"))
+    if candidates:
+        return sorted(candidates, key=lambda p: p.stat().st_mtime)[-1]
+    return run_dir
 
-    p1 = files_dir / "validation_generations.pkl"
-    p2 = files_dir / "uncertainty_measures.pkl"
 
-    if not (p1.exists() and p2.exists()):
+def load_run_artifacts(run_dir: Path) -> Optional[Dict[str, Any]]:
+    """
+    Loads:
+      - validation_generations.pkl
+      - uncertainty_measures.pkl
+      - probes.pkl (required for 3-way+CV alignment)
+    """
+    files_dir = find_wandb_files_dir(run_dir)
+
+    p_gens = files_dir / "validation_generations.pkl"
+    p_unc = files_dir / "uncertainty_measures.pkl"
+    p_probes = files_dir / "probes.pkl"
+
+    if not (p_gens.exists() and p_unc.exists() and p_probes.exists()):
         return None
 
-    with open(p1, "rb") as f:
+    with p_gens.open("rb") as f:
         gens = pickle.load(f)
-    with open(p2, "rb") as f:
+    with p_unc.open("rb") as f:
         unc = pickle.load(f)
-    return gens, unc
+    with p_probes.open("rb") as f:
+        probes = pickle.load(f)
+
+    return {
+        "files_dir": files_dir,
+        "gens": gens,
+        "unc": unc,
+        "probes": probes,
+    }
+
 
 # -----------------------------
 # Data Extraction
 # -----------------------------
 
 def _get_entropy_array(unc: dict) -> Optional[np.ndarray]:
-    ent_keys = ["cluster_assignment_entropy", "semantic_entropy_sum_normalized"]
+    ent_keys = [
+        "cluster_assignment_entropy",
+        "semantic_entropy_sum_normalized",
+        "semantic_entropy_sum-normalized",
+        "semantic_entropy_sum-normalized-rao",
+        "semantic_entropy_sum",
+    ]
+    if "uncertainty_measures" not in unc:
+        return None
     for k in ent_keys:
-        if "uncertainty_measures" in unc and k in unc["uncertainty_measures"]:
+        if k in unc["uncertainty_measures"]:
             return np.array(unc["uncertainty_measures"][k], dtype=np.float32)
     return None
 
-def _get_embedding_stack(gen_values: list, embedding_key: str) -> torch.Tensor:
+
+def _get_embedding_stack_sorted(gens: dict, embedding_key: str) -> torch.Tensor:
+    """
+    Ensures deterministic order: sort by example id key.
+    Returns tensor [n_layers, n_examples, d]
+    """
+    sorted_ids = sorted(gens.keys())
+    gen_values = [gens[k] for k in sorted_ids]
+
     embs = []
     for g in gen_values:
         if "most_likely_answer" not in g or embedding_key not in g["most_likely_answer"]:
-            raise KeyError(f"Missing embedding key {embedding_key}")
+            raise KeyError(f"Missing embedding key {embedding_key} under most_likely_answer.")
         embs.append(g["most_likely_answer"][embedding_key])
 
     tlist = [e if isinstance(e, torch.Tensor) else torch.tensor(e) for e in embs]
-    stacked = torch.stack(tlist)
+    stacked = torch.stack(tlist)  # [n, ...]
     while stacked.ndim > 3:
         stacked = stacked.squeeze(-2)
+
+    if stacked.ndim != 3:
+        raise ValueError(f"Unexpected embedding tensor shape after squeeze: {tuple(stacked.shape)}")
+
+    # [n_examples, n_layers, d] -> [n_layers, n_examples, d]
     return stacked.transpose(0, 1).contiguous()
 
+
 def extract_features_aligned(
-    gens: dict, unc: dict, embedding_key: str, n_cap: int = 2000
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    gen_values = list(gens.values())
+    gens: dict,
+    unc: dict,
+    embedding_key: str,
+    n_cap: int = 2000,
+    hall_acc_threshold: float = 0.99,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[str]]:
+    """
+    Returns:
+      X: [n_layers, n, d] float32
+      y_hall: [n] int (1=hallucination)
+      se_raw: [n] float32
+      ids: sorted ids (length n)
+    """
+    sorted_ids = sorted(gens.keys())
+    gen_values = [gens[k] for k in sorted_ids]
     n_total = len(gen_values)
 
-    # Ensure accuracy is float for comparison
     accuracies = np.array([float(g["most_likely_answer"]["accuracy"]) for g in gen_values], dtype=np.float32)
-    
-    # y_hall = 1 if Accuracy < 1.0 (Incorrect), else 0
-    y_hall = (accuracies < 0.99).astype(np.int64)
+    y_hall = (accuracies < hall_acc_threshold).astype(np.int64)
 
     se_raw = _get_entropy_array(unc)
     if se_raw is None:
         se_raw = np.zeros_like(accuracies, dtype=np.float32)
+    else:
+        # IMPORTANT: semantic entropy script also used sorted ids; assume alignment is by sorted id order
+        se_raw = se_raw.astype(np.float32)
 
-    X_t = _get_embedding_stack(gen_values, embedding_key)
+    X_t = _get_embedding_stack_sorted(gens, embedding_key=embedding_key)  # [L, n, d]
     X = X_t.cpu().numpy().astype(np.float32)
 
     n = min(n_total, X.shape[1], len(y_hall), len(se_raw), n_cap)
-    return X[:, :n, :], y_hall[:n], se_raw[:n]
+    return X[:, :n, :], y_hall[:n], se_raw[:n], sorted_ids[:n]
+
 
 # -----------------------------
-# Training & Processing
+# Probe loading helpers (robust)
 # -----------------------------
 
-def make_4way_split(n: int, seed: int) -> Dict[str, np.ndarray]:
-    fracs = np.array([0.55, 0.15, 0.15, 0.15])
-    fracs /= fracs.sum()
-    rng = np.random.default_rng(seed)
-    idx = rng.permutation(n)
-    n_train = int(round(fracs[0] * n))
-    n_val = int(round(fracs[1] * n))
-    n_cal = int(round(fracs[2] * n))
-    return {
-        "train": idx[:n_train],
-        "val": idx[n_train : n_train+n_val],
-        "cal": idx[n_train+n_val : n_train+n_val+n_cal],
-        "test": idx[n_train+n_val+n_cal:]
-    }
-
-def train_probe_layer_selection(X, y, idx_train, idx_val, C=0.1):
-    n_layers = X.shape[0]
-    best_auc = -1.0
-    best_layer = 0
-    val_aucs = []
-
-    for l in range(n_layers):
-        pipe = make_pipeline(StandardScaler(), LogisticRegression(C=C, max_iter=500))
-        # Edge case: single class in train/val
-        if len(np.unique(y[idx_train])) < 2:
-            val_aucs.append(0.5)
-            continue
-
-        pipe.fit(X[l][idx_train], y[idx_train])
-        preds = pipe.predict_proba(X[l][idx_val])[:, 1]
-        
-        try:
-            auc = roc_auc_score(y[idx_val], preds)
-        except:
-            auc = 0.5
-        val_aucs.append(auc)
-        
-        if auc > best_auc:
-            best_auc = auc
-            best_layer = l
-
-    idx_tv = np.concatenate([idx_train, idx_val])
-    if len(np.unique(y[idx_tv])) < 2:
-        final_model = None
-    else:
-        final_model = make_pipeline(StandardScaler(), LogisticRegression(C=C, max_iter=500))
-        final_model.fit(X[best_layer][idx_tv], y[idx_tv])
-    
-    return final_model, best_layer, val_aucs
-
-def process_model_dataset(
-    X: np.ndarray, y_hall: np.ndarray, se_raw: np.ndarray, seed: int
-) -> Tuple[pd.DataFrame, Dict, Dict]:
-    
-    n = len(y_hall)
-    splits = make_4way_split(n, seed)
-    idx_train = splits["train"]
-    idx_val = splits["val"]
-    
-    y_correct = 1 - y_hall
-    # Use median of Training set for SE Probe target
-    thr = np.median(se_raw[idx_train])
-    y_high_ent = (se_raw > thr).astype(np.int64)
-
-    # 1. Accuracy Probe
-    acc_model, acc_layer, acc_aucs = train_probe_layer_selection(X, y_correct, idx_train, idx_val)
-    
-    # 2. SE Probe
-    se_model, se_layer, se_aucs = train_probe_layer_selection(X, y_high_ent, idx_train, idx_val)
-
-    df = pd.DataFrame(index=np.arange(n))
-    df["split"] = "unused"
-    for k, v in splits.items():
-        df.loc[v, "split"] = k
-        
-    df["y_hall"] = y_hall
-    df["y_correct"] = y_correct
-    df["se_raw"] = se_raw
-
-    # Inference
-    if acc_model:
-        df["p_correct"] = acc_model.predict_proba(X[acc_layer])[:, 1].astype(np.float32)
-    else:
-        df["p_correct"] = 0.5
-
-    if se_model:
-        df["p_high_entropy"] = se_model.predict_proba(X[se_layer])[:, 1].astype(np.float32)
-    else:
-        df["p_high_entropy"] = 0.5
-
-    # 4. Train Combiners on Train+Val
-    idx_trainval = np.concatenate([idx_train, idx_val])
-    X_comb = df.loc[idx_trainval, ["p_correct", "p_high_entropy"]]
-    y_comb = df.loc[idx_trainval, "y_hall"]
-
-    combiners = {
-        "LR": make_pipeline(StandardScaler(), LogisticRegression(max_iter=300)),
-        "MLP": make_pipeline(StandardScaler(), MLPClassifier(hidden_layer_sizes=(32,), max_iter=500, random_state=seed)),
-        # "GBM": GradientBoostingClassifier(n_estimators=100, max_depth=3, random_state=seed)
-    }
-
-    for name, model in combiners.items():
-        if len(np.unique(y_comb)) > 1:
-            model.fit(X_comb, y_comb)
-            # Predict Prob of Hallucination (Class 1)
-            df[f"p_halluc_{name}"] = model.predict_proba(df[["p_correct", "p_high_entropy"]])[:, 1].astype(np.float32)
+def _dig(obj: Any, keys: List[str]) -> Optional[Any]:
+    cur = obj
+    for k in keys:
+        if isinstance(cur, dict) and k in cur:
+            cur = cur[k]
         else:
-            df[f"p_halluc_{name}"] = 0.5
+            return None
+    return cur
 
-    layer_stats = {
-        "acc_aucs": acc_aucs, "se_aucs": se_aucs, 
-        "acc_best": acc_layer, "se_best": se_layer
+
+def load_splits_from_probes(probes_obj: dict) -> Dict[str, np.ndarray]:
+    if "splits" not in probes_obj:
+        raise KeyError("probes.pkl missing top-level 'splits' key.")
+
+    splits = probes_obj["splits"]
+    required = ["train", "calibration", "test"]
+
+    for k in required:
+        if k not in splits:
+            raise KeyError(f"probes.pkl missing split '{k}'")
+
+    return {
+        "train": np.asarray(splits["train"], dtype=np.int64),
+        "cal": np.asarray(splits["calibration"], dtype=np.int64),
+        "test": np.asarray(splits["test"], dtype=np.int64),
     }
-    
-    return df, layer_stats, splits
+
+
+
+def load_probe_bundle(probes_obj: dict, position: str = "tbg") -> Dict[str, Any]:
+    if "probes" not in probes_obj:
+        raise KeyError("probes.pkl missing 'probes'")
+
+    if position not in probes_obj["probes"]:
+        raise KeyError(f"probes.pkl missing position '{position}'")
+
+    p = probes_obj["probes"][position]
+
+    return {
+        "acc_model": p["acc"]["model"],
+        "acc_best_layer": int(p["acc"]["best_layer"]),
+        "acc_cv_aucs": list(p["acc"]["cv_auc_per_layer"]),
+        "se_model": p["se"]["model"],
+        "se_best_layer": int(p["se"]["best_layer"]),
+        "se_cv_aucs": list(p["se"]["cv_auc_per_layer"]),
+    }
+
+
+
+def maybe_train_all_probes(
+    runs_root: Path,
+    cfg_yaml: Path,
+    train_probes_script: Path,
+    retrain: bool,
+) -> None:
+    """
+    Optionally retrain probes for ALL runs found under runs_root.
+    Called ONCE at analysis start.
+    """
+    if not retrain:
+        return
+
+    print("[analysis] Retraining probes for all available runs...")
+
+    cmd = [
+        "python",
+        str(train_probes_script),
+        "--config", str(cfg_yaml),
+        "--runs-root", str(runs_root),
+    ]
+
+    subprocess.run(cmd, check=True)
+
 
 # -----------------------------
-# Conformal & Metrics
+# "Calibration" / thresholding helpers (1D)
 # -----------------------------
 
 def try_clopper_pearson_ucb(k: int, n: int, delta: float) -> float:
     try:
         from scipy.stats import beta
-        if k == n: return 1.0
+        if n <= 0:
+            return 1.0
+        if k >= n:
+            return 1.0
         return float(beta.ppf(1 - delta, k + 1, n - k))
-    except:
-        return k / n
+    except Exception:
+        return (k / n) if n > 0 else 1.0
 
-def select_threshold_1d(scores, labels, alpha, delta, use_ucb):
+
+def select_threshold_1d(scores: np.ndarray, labels: np.ndarray, alpha: float, delta: float, use_ucb: bool) -> float:
     """
-    Selects threshold t such that empirical risk (or UCB) of accepted set is <= alpha.
+    Scores are risk scores (lower = safer).
+    Accept if score <= t.
+    We choose the largest t (max coverage) such that risk (or UCB) <= alpha on calibration.
     """
-    # 1. Sort: Low Score (Safe) -> High Score (Risky)
-    order = np.argsort(scores)
+    scores = np.asarray(scores)
+    labels = np.asarray(labels)
+
+    order = np.argsort(scores)  # safest -> riskiest
     y_sorted = labels[order]
     s_sorted = scores[order]
-    
-    # 2. Compute Risk Profile
-    cum_failures = np.cumsum(y_sorted).astype(float)
+
+    cum_fail = np.cumsum(y_sorted).astype(float)
     counts = np.arange(1, len(y_sorted) + 1).astype(float)
-    
+
     if use_ucb:
-        risks = np.array([try_clopper_pearson_ucb(int(k), int(n), delta) for k, n in zip(cum_failures, counts)])
+        risks = np.array([try_clopper_pearson_ucb(int(k), int(n), delta) for k, n in zip(cum_fail, counts)])
     else:
-        risks = cum_failures / counts
+        risks = cum_fail / counts
 
-    # 3. Find Feasible Points
     feasible = risks <= alpha
-    
-    # 4. Select Threshold (Max Coverage)
     if not np.any(feasible):
-        # Even the single safest point is too risky (or set is empty)
-        return -np.inf 
-    
-    last_feasible_idx = np.where(feasible)[0][-1]
-    return s_sorted[last_feasible_idx]
+        return -np.inf  # accept nothing
 
-def eval_conformal(df, score_col, alpha, delta, use_ucb):
+    last_idx = np.where(feasible)[0][-1]
+    return float(s_sorted[last_idx])
+
+
+def eval_calibration(df: pd.DataFrame, score_col: str, alpha: float, delta: float, use_ucb: bool) -> Tuple[float, float]:
+    """
+    Threshold picked on cal split, evaluated on test.
+    Returns (realized_risk, coverage).
+    """
     cal = df[df["split"] == "cal"]
     test = df[df["split"] == "test"]
-    
-    t = select_threshold_1d(
-        cal[score_col].values, cal["y_hall"].values, 
-        alpha, delta, use_ucb
-    )
-    
+
+    t = select_threshold_1d(cal[score_col].values, cal["y_hall"].values, alpha, delta, use_ucb)
+    if np.isinf(t) and t < 0:
+        return 0.0, 0.0
+
     accept = test[score_col].values <= t
     cov = float(accept.mean())
     risk = float(test.loc[accept, "y_hall"].mean()) if accept.sum() > 0 else 0.0
     return risk, cov
 
-def get_risk_coverage_curve(df_test, score_col):
+
+def get_risk_coverage_curve(df_test: pd.DataFrame, score_col: str) -> Tuple[List[float], List[float]]:
+    """
+    Sweep thresholds by sorting risk scores ascending.
+    Returns coverage and risk arrays (monotone).
+    """
     scores = df_test[score_col].values
     y = df_test["y_hall"].values
-    order = np.argsort(scores) # Low (Safe) -> High
+
+    order = np.argsort(scores)  # safest -> riskiest
     y_sorted = y[order]
-    
-    n = len(y)
-    accepted_counts = np.arange(1, n + 1)
-    cum_risk = np.cumsum(y_sorted) / accepted_counts
-    covs = accepted_counts / n
-    
-    # Downsample for plotting file size
+
+    n = len(y_sorted)
+    accepted = np.arange(1, n + 1)
+    risk = np.cumsum(y_sorted) / accepted
+    cov = accepted / n
+
+    # downsample for file size
     if n > 300:
-        idx = np.linspace(0, n-1, 300).astype(int)
-        return list(covs[idx]), list(cum_risk[idx])
-    return list(covs), list(cum_risk)
+        idx = np.linspace(0, n - 1, 300).astype(int)
+        return list(cov[idx]), list(risk[idx])
+
+    return list(cov), list(risk)
+
 
 # -----------------------------
 # Plotting
 # -----------------------------
 
-def plot_detection_bars(df_det, figures_dir):
-    # Fix: Plot PER MODEL to avoid aggregation confusion
+def plot_detection_bars(df_det: pd.DataFrame, figures_dir: Path) -> None:
     for model in df_det["Model"].unique():
         for subset in ["Full", "Confident"]:
             data = df_det[(df_det["Model"] == model) & (df_det["Subset"] == subset)]
-            if data.empty: continue
-            
+            if data.empty:
+                continue
+
             plt.figure(figsize=(9, 6))
             sns.barplot(
-                data=data, x="Dataset", y="AUROC", hue="Method",
-                palette=COLORS, edgecolor="black", errorbar=None,
-                hue_order=[m for m in METHOD_ORDER if m in data["Method"].unique()]
+                data=data,
+                x="Dataset",
+                y="AUROC",
+                hue="Method",
+                palette=COLORS,
+                edgecolor="black",
+                errorbar=None,
+                hue_order=[m for m in METHOD_ORDER if m in data["Method"].unique()],
             )
             plt.title(f"{model} - {subset} Subset")
             plt.ylim(0.4, 1.0)
             plt.legend(bbox_to_anchor=(1.05, 1), loc="upper left")
             plt.tight_layout()
-            
+
             safe_model = model.replace("/", "_")
             plt.savefig(figures_dir / f"detection_{safe_model}_{subset}.png", dpi=300)
             plt.close()
 
-def plot_risk_coverage(curve_data, figures_dir, base_risks):
+
+def plot_layer_sensitivity(layer_results: List[dict], figures_dir: Path) -> None:
+    for item in layer_results:
+        acc_aucs = item.get("acc_cv_aucs", [])
+        se_aucs = item.get("se_cv_aucs", [])
+        L = max(len(acc_aucs), len(se_aucs))
+        if L <= 1:
+            continue
+
+        x = np.linspace(0, 1, L)
+
+        plt.figure(figsize=(8, 5))
+        if acc_aucs:
+            plt.plot(x[:len(acc_aucs)], acc_aucs, label="Accuracy Probe (CV AUROC)", color=COLORS["Accuracy Probe"], linewidth=2.5)
+        if se_aucs:
+            plt.plot(x[:len(se_aucs)], se_aucs, label="SE Probe (CV AUROC)", color=COLORS["SE Probe"], linestyle="--", linewidth=2.5)
+
+        plt.xlabel("Layer Depth (normalized)")
+        plt.ylabel("CV AUROC")
+        plt.title(f"Layer Sensitivity: {item['Model']} / {item['Dataset']}")
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        safe_model = item["Model"].replace("/", "_")
+        plt.savefig(figures_dir / f"layers_{safe_model}_{item['Dataset']}.png", dpi=300)
+        plt.close()
+
+
+def plot_risk_coverage(curve_data: dict, figures_dir: Path, base_risks: dict) -> None:
     """
-    Plots RC curves with dynamic limits and an 'Ideal' oracle line.
-    base_risks: dict mapping (model, dataset) -> float (base hallucination rate)
+    Includes an "Ideal (Oracle)" line based on base risk on the test set.
     """
     for model, dsets in curve_data.items():
         for ds, methods in dsets.items():
             plt.figure(figsize=(8, 6))
-            
-            # 1. Plot Ideal Oracle
-            # Ideal: Risk is 0 until coverage = (1 - base_risk), then rises to base_risk
-            base_risk = base_risks.get((model, ds), 0.5)
-            max_safe_cov = 1.0 - base_risk
-            
-            ideal_x = [0, max_safe_cov, 1.0]
-            ideal_y = [0, 0, base_risk]
-            
-            plt.plot(ideal_x, ideal_y, linestyle="--", color="black", 
-                     label="Ideal (Oracle)", alpha=0.6, linewidth=1.5)
-            
-            # 2. Plot Methods
-            max_r = base_risk # Start max tracking at base risk
+
+            base_risk = float(base_risks.get((model, ds), 0.5))
+            max_safe_cov = max(0.0, 1.0 - base_risk)
+
+            ideal_x = [0.0, max_safe_cov, 1.0]
+            ideal_y = [0.0, 0.0, base_risk]
+            plt.plot(ideal_x, ideal_y, linestyle="--", color="black", label="Ideal (Oracle)", alpha=0.6, linewidth=1.5)
+
+            max_r = base_risk
             for m_name, (cov, risk) in methods.items():
-                if "GBM" in m_name: continue
                 plt.plot(cov, risk, label=m_name, color=COLORS.get(m_name, "black"), linewidth=2.5)
-                if risk:
+                if len(risk) > 0:
                     max_r = max(max_r, max(risk))
-            
+
             plt.xlabel("Coverage")
             plt.ylabel("Hallucination Rate (Risk)")
             plt.title(f"Risk-Coverage: {model} / {ds}")
             plt.legend()
             plt.xlim(0, 1)
-            
-            # Dynamic Y: Show enough to see the base risk + a bit of margin
+
             top_lim = min(1.0, max_r * 1.15) if max_r > 0 else 1.0
             plt.ylim(0, top_lim)
             plt.grid(True, alpha=0.3)
-            
+
             safe_model = model.replace("/", "_")
             plt.savefig(figures_dir / f"rc_{safe_model}_{ds}.png", dpi=300)
             plt.close()
 
-def plot_decision_boundary(df, model, ds, alpha, delta, use_ucb, out_path, combiner_type="MLP"):
-    cal = df[df["split"] == "cal"]
-    trainval = df[df["split"].isin(["train", "val"])]
-    
-    if combiner_type == "MLP":
-        clf = make_pipeline(StandardScaler(), MLPClassifier(hidden_layer_sizes=(32,), max_iter=500, random_state=42))
-    elif combiner_type == "GBM":
-        clf = GradientBoostingClassifier(n_estimators=100, max_depth=3, random_state=42)
-    else:
-        clf = make_pipeline(StandardScaler(), LogisticRegression(max_iter=300))
-        
-    X_train = trainval[["p_correct", "p_high_entropy"]]
-    y_train = trainval["y_hall"]
-    
-    if len(np.unique(y_train)) < 2: return
-    clf.fit(X_train, y_train)
-    
-    score_col = f"p_halluc_{combiner_type}"
-    scores_cal = df.loc[cal.index, score_col].values
-    t_star = select_threshold_1d(scores_cal, cal["y_hall"].values, alpha, delta, use_ucb)
-    
-    if np.isinf(t_star): return
 
-    plt.figure(figsize=(7, 6))
-    mask_c = cal["y_hall"] == 0
-    mask_h = cal["y_hall"] == 1
-    
-    plt.scatter(cal.loc[mask_c, "p_correct"], cal.loc[mask_c, "p_high_entropy"], 
-                c=COLORS["Accuracy Probe"], alpha=0.3, s=20, label="Correct")
-    plt.scatter(cal.loc[mask_h, "p_correct"], cal.loc[mask_h, "p_high_entropy"], 
-                c=COLORS["Combined (GBM)"], alpha=0.3, s=20, label="Hallucination")
-    
-    xx, yy = np.meshgrid(np.linspace(0, 1, 100), np.linspace(0, 1, 100))
-    grid = np.c_[xx.ravel(), yy.ravel()]
-    probs = clf.predict_proba(pd.DataFrame(grid, columns=["p_correct", "p_high_entropy"]))[:, 1]
-    probs = probs.reshape(xx.shape)
-    
-    plt.contour(xx, yy, probs, levels=[t_star], colors='k', linewidths=2.5, linestyles='--')
-    plt.contourf(xx, yy, probs, levels=[0, t_star], colors=[COLORS["Combined (LR)"]], alpha=0.15)
-    
-    plt.xlabel("Accuracy Probe ($P_{correct}$)")
-    plt.ylabel("SE Probe ($P_{high\_entropy}$)")
-    plt.title(f"Decision Boundary ({combiner_type}) @ $\\alpha={alpha}$")
-    plt.xlim(0, 1)
-    plt.ylim(0, 1)
-    plt.legend(loc="upper right")
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=300)
-    plt.close()
-
-def plot_layer_sensitivity(layer_results, figures_dir):
-    for item in layer_results:
-        acc_aucs = item["acc_aucs"]
-        se_aucs = item["se_aucs"]
-        L = len(acc_aucs)
-        x = np.linspace(0, 1, L)
-
-        plt.figure(figsize=(8, 5))
-        plt.plot(x, acc_aucs, label="Accuracy Probe", color=COLORS["Accuracy Probe"], linewidth=2.5)
-        plt.plot(x, se_aucs, label="SE Probe", color=COLORS["SE Probe"], linestyle="--", linewidth=2.5)
-        plt.xlabel("Layer Depth (normalized)")
-        plt.ylabel("Validation AUROC")
-        plt.title(f"Layer Sensitivity: {item['Model']} / {item['Dataset']}")
-        plt.legend()
-        plt.grid(True, alpha=0.3)
-        plt.tight_layout()
-        safe_model = item['Model'].replace("/", "_")
-        plt.savefig(figures_dir / f"layers_{safe_model}_{item['Dataset']}.png", dpi=300)
-        plt.close()
-
-def plot_calibration_curves(df_cal, figures_dir):
+def plot_calibration_curves(df_cal: pd.DataFrame, figures_dir: Path) -> None:
     """
-    Plots Target Risk (x) vs Realized Risk (y) for each model.
-    Layout: 1 row x N datasets subplots per model.
+    Plots Target risk (x) vs Realized risk (y), per model, with subplots per dataset.
     """
     unique_models = df_cal["Model"].unique()
     unique_datasets = sorted(df_cal["Dataset"].unique())
@@ -519,24 +516,30 @@ def plot_calibration_curves(df_cal, figures_dir):
 
     for model in unique_models:
         model_data = df_cal[df_cal["Model"] == model]
-        if model_data.empty: continue
+        if model_data.empty:
+            continue
 
-        # Setup subplots (1 row, N columns)
         fig, axes = plt.subplots(1, n_ds, figsize=(5 * n_ds, 5.5), sharey=True)
-        if n_ds == 1: axes = [axes]
+        if n_ds == 1:
+            axes = [axes]
 
-        fig.suptitle(f"Conformal Calibration: {model}", fontsize=15, y=0.98)
+        fig.suptitle(f"Calibration (threshold on cal, eval on test): {model}", fontsize=15, y=0.98)
 
         for i, (ax, ds) in enumerate(zip(axes, unique_datasets)):
             ds_data = model_data[model_data["Dataset"] == ds]
-            
-            # Identity line (Ideal)
+
             ax.plot([0, 1], [0, 1], "k--", alpha=0.5, linewidth=1.5)
 
             if not ds_data.empty:
                 sns.lineplot(
-                    data=ds_data, x="Target", y="Realized", hue="Method",
-                    palette=COLORS, linewidth=2.5, ax=ax, legend=False
+                    data=ds_data,
+                    x="Target",
+                    y="Realized",
+                    hue="Method",
+                    palette=COLORS,
+                    linewidth=2.5,
+                    ax=ax,
+                    legend=False,
                 )
 
             ax.set_title(ds)
@@ -550,165 +553,162 @@ def plot_calibration_curves(df_cal, figures_dir):
             else:
                 ax.set_ylabel("")
 
-        # Create a single unified legend outside the subplots
-        # We grab handles from the last subplot that had data
-        handles, labels = [], []
-        for ax in axes:
-            if ax.lines: # If data was plotted (beyond the identity line)
-                # Create dummy handles for the legend based on color map
-                # (Seaborn makes this tricky to extract perfectly from ax without legend=True)
-                # Simpler: create a dummy plot to steal handles
-                dummy_fig = plt.figure()
-                dummy_ax = dummy_fig.add_subplot(111)
-                sns.lineplot(data=model_data, x="Target", y="Realized", hue="Method", palette=COLORS, ax=dummy_ax)
-                handles, labels = dummy_ax.get_legend_handles_labels()
-                plt.close(dummy_fig)
-                break
-        
+        # unified legend
+        dummy_fig = plt.figure()
+        dummy_ax = dummy_fig.add_subplot(111)
+        sns.lineplot(data=model_data, x="Target", y="Realized", hue="Method", palette=COLORS, ax=dummy_ax)
+        handles, labels = dummy_ax.get_legend_handles_labels()
+        plt.close(dummy_fig)
         if handles:
-            fig.legend(handles, labels, loc='lower center', bbox_to_anchor=(0.5, -0.05), ncol=len(labels), frameon=False)
+            fig.legend(handles, labels, loc="lower center", bbox_to_anchor=(0.5, -0.05), ncol=len(labels), frameon=False)
 
         plt.tight_layout()
-        # Adjust layout to make room for the legend at the bottom
         plt.subplots_adjust(bottom=0.15)
-        
+
         safe_model = model.replace("/", "_")
-        plt.savefig(figures_dir / f"calibration_{safe_model}.png", dpi=300, bbox_inches='tight')
+        plt.savefig(figures_dir / f"calibration_{safe_model}.png", dpi=300, bbox_inches="tight")
         plt.close()
 
+
+def plot_decision_boundary(
+    df: pd.DataFrame,
+    combiner_model,
+    score_col: str,
+    alpha: float,
+    delta: float,
+    use_ucb: bool,
+    out_path: Path,
+    title: str,
+) -> None:
+    """
+    Uses the SAME fitted combiner_model that produced score_col.
+    Draws contour at calibrated threshold t* found on cal.
+    """
+    cal = df[df["split"] == "cal"]
+    if cal.empty:
+        return
+
+    # threshold on cal
+    t_star = select_threshold_1d(cal[score_col].values, cal["y_hall"].values, alpha, delta, use_ucb)
+    if np.isinf(t_star) and t_star < 0:
+        return
+
+    # scatter
+    plt.figure(figsize=(7, 6))
+    mask_c = cal["y_hall"] == 0
+    mask_h = cal["y_hall"] == 1
+
+    plt.scatter(cal.loc[mask_c, "p_correct"], cal.loc[mask_c, "p_high_entropy"],
+                c=COLORS["Accuracy Probe"], alpha=0.3, s=20, label="Correct")
+    plt.scatter(cal.loc[mask_h, "p_correct"], cal.loc[mask_h, "p_high_entropy"],
+                c=COLORS["Combined (MLP)"], alpha=0.3, s=20, label="Hallucination")
+
+    # grid
+    xx, yy = np.meshgrid(np.linspace(0, 1, 200), np.linspace(0, 1, 200))
+    grid = np.c_[xx.ravel(), yy.ravel()]
+    grid_df = pd.DataFrame(grid, columns=["p_correct", "p_high_entropy"])
+
+    probs = combiner_model.predict_proba(grid_df)[:, 1]
+    probs = probs.reshape(xx.shape)
+
+    plt.contour(xx, yy, probs, levels=[t_star], colors="k", linewidths=2.5, linestyles="--")
+    plt.contourf(xx, yy, probs, levels=[0, t_star], colors=[COLORS["Combined (LR)"]], alpha=0.12)
+
+    plt.xlabel("Accuracy Probe ($P_{correct}$)")
+    plt.ylabel("SE Probe ($P_{high\\_entropy}$)")
+    plt.title(f"{title} @ $\\alpha={alpha}$")
+    plt.xlim(0, 1)
+    plt.ylim(0, 1)
+    plt.legend(loc="upper right")
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=300)
+    plt.close()
+
+
 # -----------------------------
-# LaTeX Generation
+# LaTeX Tables
 # -----------------------------
 
-def latex_escape(s):
+def latex_escape(s: str) -> str:
     return str(s).replace("_", r"\_").replace("%", r"\%")
 
-def write_auroc_table(df_det, figures_dir):
-    """
-    Generates a LaTeX table summarizing AUROC.
-    Rows: Models -> Methods
-    Cols: Datasets -> (Full, Confident)
-    """
-    # Filter to desired methods only
+
+def write_auroc_table(df_det: pd.DataFrame, figures_dir: Path) -> None:
     df = df_det[df_det["Method"].isin(METHOD_ORDER)].copy()
-    if df.empty: return
+    if df.empty:
+        return
 
     datasets = sorted(df["Dataset"].unique())
     models = sorted(df["Model"].unique())
 
-    # Pre-calculate winners for bolding
-    # Key: (Model, Dataset, Subset) -> Value: Max AUROC
     winners = {}
     for model in models:
         for ds in datasets:
             for subset in ["Full", "Confident"]:
-                subset_data = df[
-                    (df["Model"] == model) & 
-                    (df["Dataset"] == ds) & 
-                    (df["Subset"] == subset)
-                ]
-                if not subset_data.empty:
-                    winners[(model, ds, subset)] = subset_data["AUROC"].max()
-                else:
-                    winners[(model, ds, subset)] = -1.0
+                sd = df[(df["Model"] == model) & (df["Dataset"] == ds) & (df["Subset"] == subset)]
+                winners[(model, ds, subset)] = sd["AUROC"].max() if not sd.empty else -1.0
 
     lines = []
-    
-    # ------------------
-    # Table Header
-    # ------------------
-    # Columns: Method + (Full, Conf) * N_Datasets
     col_spec = "l" + "cc" * len(datasets)
     lines.append(rf"\begin{{tabular}}{{{col_spec}}}")
     lines.append(r"\toprule")
 
-    # Row 1: Dataset Names
     header_1 = [r"\textbf{Method}"]
     for ds in datasets:
-        ds_name = latex_escape(ds).replace(" ", r"~") # Prevent wrapping if possible
-        header_1.append(rf"\multicolumn{{2}}{{c}}{{\textbf{{{ds_name}}}}}")
+        header_1.append(rf"\multicolumn{{2}}{{c}}{{\textbf{{{latex_escape(ds)}}}}}")
     lines.append(" & ".join(header_1) + r" \\")
 
-    # Row 2: Subset Names
-    header_2 = [r""] # Empty cell under Method
+    header_2 = [r""]
     for _ in datasets:
         header_2.extend([r"\scriptsize{Full}", r"\scriptsize{Conf}"])
     lines.append(" & ".join(header_2) + r" \\")
     lines.append(r"\midrule")
 
-    # ------------------
-    # Table Body
-    # ------------------
     for model in models:
-        # Section Header for Model
-        model_name = latex_escape(model)
-        lines.append(rf"\multicolumn{{{1 + 2*len(datasets)}}}{{l}}{{\textbf{{{model_name}}}}} \\")
-        
+        lines.append(rf"\multicolumn{{{1 + 2*len(datasets)}}}{{l}}{{\textbf{{{latex_escape(model)}}}}} \\")
         for method in METHOD_ORDER:
             row = [latex_escape(method)]
-            
             for ds in datasets:
-                # Get Full Value
-                val_full_series = df[(df["Model"] == model) & (df["Dataset"] == ds) & (df["Method"] == method) & (df["Subset"] == "Full")]["AUROC"]
-                val_full = val_full_series.iloc[0] if not val_full_series.empty else 0.0
-                
-                # Get Confident Value
-                val_conf_series = df[(df["Model"] == model) & (df["Dataset"] == ds) & (df["Method"] == method) & (df["Subset"] == "Confident")]["AUROC"]
-                val_conf = val_conf_series.iloc[0] if not val_conf_series.empty else 0.0
+                v_full = df[(df["Model"] == model) & (df["Dataset"] == ds) & (df["Method"] == method) & (df["Subset"] == "Full")]["AUROC"]
+                v_conf = df[(df["Model"] == model) & (df["Dataset"] == ds) & (df["Method"] == method) & (df["Subset"] == "Confident")]["AUROC"]
 
-                # Format strings
+                val_full = float(v_full.iloc[0]) if not v_full.empty else 0.0
+                val_conf = float(v_conf.iloc[0]) if not v_conf.empty else 0.0
+
                 s_full = f"{val_full:.3f}"
                 s_conf = f"{val_conf:.3f}"
 
-                # Apply Bolding (Comparison with tolerance)
-                best_full = winners.get((model, ds, "Full"), -1)
-                best_conf = winners.get((model, ds, "Confident"), -1)
-
-                if val_full >= best_full - 1e-6:
+                if val_full >= winners.get((model, ds, "Full"), -1) - 1e-6:
                     s_full = rf"\textbf{{{s_full}}}"
-                
-                if val_conf >= best_conf - 1e-6:
+                if val_conf >= winners.get((model, ds, "Confident"), -1) - 1e-6:
                     s_conf = rf"\textbf{{{s_conf}}}"
 
                 row.extend([s_full, s_conf])
-
             lines.append(" & ".join(row) + r" \\")
-        
         lines.append(r"\addlinespace")
 
     lines.append(r"\bottomrule")
     lines.append(r"\end{tabular}")
 
-    out_path = figures_dir / "detection_auroc_table.tex"
-    with open(out_path, "w") as f:
+    with open(figures_dir / "detection_auroc_table.tex", "w") as f:
         f.write("\n".join(lines))
 
 
-def write_aurc_table(df_aurc, figures_dir):
-    """
-    Generates LaTeX table for AURC (Area Under Risk-Coverage).
-    Lower is Better.
-    """
-    # Filter methods
+def write_aurc_table(df_aurc: pd.DataFrame, figures_dir: Path) -> None:
     df = df_aurc[df_aurc["Method"].isin(METHOD_ORDER)].copy()
-    if df.empty: return
+    if df.empty:
+        return
 
     datasets = sorted(df["Dataset"].unique())
     models = sorted(df["Model"].unique())
 
-    # Pre-calculate Winners (Min AURC)
     winners = {}
     for model in models:
         for ds in datasets:
-            subset_data = df[(df["Model"] == model) & (df["Dataset"] == ds)]
-            if not subset_data.empty:
-                winners[(model, ds)] = subset_data["AURC"].min()
-            else:
-                winners[(model, ds)] = 100.0
+            sd = df[(df["Model"] == model) & (df["Dataset"] == ds)]
+            winners[(model, ds)] = sd["AURC"].min() if not sd.empty else 1e9
 
     lines = []
-    
-    # Header
     col_spec = "l" + "c" * len(datasets)
     lines.append(rf"\begin{{tabular}}{{{col_spec}}}")
     lines.append(r"\toprule")
@@ -717,31 +717,20 @@ def write_aurc_table(df_aurc, figures_dir):
     lines.append(" & ".join(header) + r" \\")
     lines.append(r"\midrule")
 
-    # Body
     for model in models:
         lines.append(rf"\multicolumn{{{1 + len(datasets)}}}{{l}}{{\textbf{{{latex_escape(model)}}}}} \\")
-        
         for method in METHOD_ORDER:
             row = [latex_escape(method)]
-            
             for ds in datasets:
-                val_series = df[(df["Model"] == model) & (df["Dataset"] == ds) & (df["Method"] == method)]["AURC"]
-                
-                if val_series.empty:
+                v = df[(df["Model"] == model) & (df["Dataset"] == ds) & (df["Method"] == method)]["AURC"]
+                if v.empty:
                     row.append("-")
                 else:
-                    val = val_series.iloc[0]
-                    # AURC is often small, maybe multiply by 100 or keep as is? 
-                    # Usually 3 decimal places is fine.
-                    s_val = f"{val:.3f}"
-                    
-                    # Bold if Minimal (Lower is Better)
-                    best = winners.get((model, ds), 100.0)
-                    if val <= best + 1e-6:
-                        s_val = rf"\textbf{{{s_val}}}"
-                    
-                    row.append(s_val)
-            
+                    val = float(v.iloc[0])
+                    s = f"{val:.3f}"
+                    if val <= winners.get((model, ds), 1e9) + 1e-6:
+                        s = rf"\textbf{{{s}}}"
+                    row.append(s)
             lines.append(" & ".join(row) + r" \\")
         lines.append(r"\addlinespace")
 
@@ -752,24 +741,24 @@ def write_aurc_table(df_aurc, figures_dir):
         f.write("\n".join(lines))
 
 
-def write_conformal_tables(df_cal, figures_dir, table_alphas):
+def write_calibration_tables(df_cal: pd.DataFrame, figures_dir: Path, table_alphas: List[float]) -> None:
     df = df_cal.copy()
     df["Target"] = df["Target"].round(3)
     keep = [round(a, 3) for a in table_alphas]
     df = df[df["Target"].isin(keep)]
     df = df[df["Method"].isin(METHOD_ORDER)]
-    
-    if df.empty: return
+    if df.empty:
+        return
 
     for dataset in sorted(df["Dataset"].unique()):
         dfd = df[df["Dataset"] == dataset]
         alphas = sorted(keep)
-        
+
         lines = []
         col_spec = "l" + "cc" * len(alphas)
         lines.append(rf"\begin{{tabular}}{{{col_spec}}}")
         lines.append(r"\toprule")
-        
+
         h1 = [r"\textbf{Method}"] + [rf"\multicolumn{{2}}{{c}}{{\textbf{{$\alpha={a}$}}}}" for a in alphas]
         lines.append(" & ".join(h1) + r" \\")
         h2 = [r"\textbf{Method}"] + [r"\textbf{Cov}", r"\textbf{Risk}"] * len(alphas)
@@ -779,53 +768,47 @@ def write_conformal_tables(df_cal, figures_dir, table_alphas):
         for model in sorted(dfd["Model"].unique()):
             dfm = dfd[dfd["Model"] == model]
             lines.append(rf"\multicolumn{{{1 + 2*len(alphas)}}}{{l}}{{\textbf{{{latex_escape(model)}}}}} \\")
-            
+
+            # winners per alpha (bold)
             winners = {}
             for a in alphas:
                 blk = dfm[dfm["Target"] == a]
-                # Filter valid results (Risk <= Target + epsilon)
                 valid = blk[blk["Realized"] <= a + 0.005]
-                
+
                 best_cov_m = None
-                if not valid.empty:
-                    best_cov_m = valid.sort_values("Coverage", ascending=False).iloc[0]["Method"]
-                
                 best_risk_m = None
                 if not valid.empty:
+                    best_cov_m = valid.sort_values("Coverage", ascending=False).iloc[0]["Method"]
                     best_risk_m = valid.sort_values("Realized", ascending=False).iloc[0]["Method"]
-                
                 winners[a] = (best_cov_m, best_risk_m)
 
             for method in METHOD_ORDER:
                 row = [latex_escape(method)]
                 row_dat = dfm[dfm["Method"] == method]
-                
                 for a in alphas:
                     cell = row_dat[row_dat["Target"] == a]
                     if cell.empty:
                         row.extend(["-", "-"])
                     else:
-                        c = cell.iloc[0]["Coverage"]
-                        r = cell.iloc[0]["Realized"]
+                        c = float(cell.iloc[0]["Coverage"])
+                        r = float(cell.iloc[0]["Realized"])
                         c_str = f"{c:.3f}"
                         r_str = f"{r:.3f}"
-                        
                         w_cov, w_risk = winners[a]
-                        # Bold Highest Coverage
-                        if method == w_cov: c_str = rf"\textbf{{{c_str}}}"
-                        # Bold Risk closest to target (valid)
-                        if method == w_risk: r_str = rf"\textbf{{{r_str}}}"
-                        
+                        if method == w_cov:
+                            c_str = rf"\textbf{{{c_str}}}"
+                        if method == w_risk:
+                            r_str = rf"\textbf{{{r_str}}}"
                         row.extend([c_str, r_str])
-                
                 lines.append(" & ".join(row) + r" \\")
             lines.append(r"\addlinespace")
-        
+
         lines.append(r"\bottomrule")
         lines.append(r"\end{tabular}")
-        
-        with open(figures_dir / f"conformal_table_{dataset}.tex", "w") as f:
+
+        with open(figures_dir / f"calibration_table_{dataset}.tex", "w") as f:
             f.write("\n".join(lines))
+
 
 # -----------------------------
 # Main
@@ -834,10 +817,48 @@ def write_conformal_tables(df_cal, figures_dir, table_alphas):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--runs-root", type=str, required=True)
-    parser.add_argument("--figures-dirname", type=str, default="analysis_output_v3")
+    parser.add_argument("--figures-dirname", type=str, default="analysis_output_v4")
+    # parser.add_argument("--embedding-key", type=str, default="emb_last_tok_before_gen")
+    parser.add_argument("--n-cap", type=int, default=2000)
+    parser.add_argument("--hall-acc-threshold", type=float, default=0.99)
+
     parser.add_argument("--use-ucb", action="store_true")
     parser.add_argument("--delta", type=float, default=0.1)
-    parser.add_argument("--decision-plot-method", type=str, default="MLP")
+
+    parser.add_argument("--decision-plot-method", type=str, default="MLP", choices=["LR", "MLP", "GBM"])
+    parser.add_argument("--decision-plot-alpha", type=float, default=0.10)
+    parser.add_argument(
+    "--retrain-probes",
+    action="store_true",
+    help="Force retraining probes by calling train_probes.py before analysis."
+)
+
+    parser.add_argument(
+        "--train-probes-script",
+        type=str,
+        default="scripts/train_probes.py",
+        help="Path to train_probes.py"
+    )
+
+    parser.add_argument(
+        "--config",
+        type=str,
+        required=True,
+        help="Config YAML used for training probes (same as generation)."
+    )
+
+    parser.add_argument(
+        "--position",
+        type=str,
+        default="tbg",
+        choices=["tbg", "slt"],
+        help="Which probe position to use: "
+            "tbg = token before generation (default), "
+            "slt = second-to-last token in answer."
+    )
+
+
+
     args = parser.parse_args()
 
     repo_root, runs_root = resolve_paths(args.runs_root)
@@ -846,53 +867,126 @@ def main():
 
     det_results = []
     cal_results = []
-    layer_results_list = []
-    curve_data = {} 
+    layer_results = []
+    curve_data: Dict[str, Dict[str, Dict[str, Tuple[List[float], List[float]]]]] = {}
     aurc_results = []
-    base_risks = {} # Store base risk per (model, dataset) for the Ideal curve
+    base_risks = {}
 
-    print(f"Scanning {runs_root}...")
+    print(f"Scanning {runs_root} ...")
+    if args.use_ucb:
+        print(f"Using UCB selection with delta={args.delta}")
+
+    # Before iterating over models/datasets
+    maybe_train_all_probes(
+        runs_root=runs_root,
+        cfg_yaml=Path(args.config),
+        train_probes_script=Path(args.train_probes_script),
+        retrain=args.retrain_probes,
+    )
 
     for model_name in DEFAULT_TARGET_MODELS:
         safe_model = Path(model_name).name
         curve_data[safe_model] = {}
-        
+
         for dataset_name in DEFAULT_TARGET_DATASETS:
             run_dir = find_run_directory(runs_root, model_name, dataset_name)
-            if not run_dir: continue
-            
-            print(f"Processing {safe_model} / {dataset_name}...")
-            
-            try:
-                pickles = load_pickles(run_dir)
-                if not pickles: continue
-                X, y, se = extract_features_aligned(*pickles, embedding_key="emb_last_tok_before_gen")
-                df, l_stats, splits = process_model_dataset(X, y, se, seed=42)
-                
-                # # --- DEBUG CHECK ---
-                # cal_df = df[df["split"] == "cal"]
-                # cal_risk = cal_df["y_hall"].mean()
-                # print(f"  [Info] Calibration set size: {len(cal_df)}, Hallucination Rate: {cal_risk:.3f}")
-                # if cal_risk == 0.0 or cal_risk == 1.0:
-                #     print("  [Warning] Calibration risk is 0 or 1. Conformal prediction may fail to find thresholds.")
-                # # -------------------
-                
-            except Exception as e:
-                print(f"  Failed: {e}")
+            if not run_dir:
                 continue
 
-            layer_results_list.append({
-                "Model": safe_model, "Dataset": dataset_name,
-                "acc_aucs": l_stats["acc_aucs"], "se_aucs": l_stats["se_aucs"]
+            artifacts = load_run_artifacts(run_dir)
+            if artifacts is None:
+                continue
+
+            gens = artifacts["gens"]
+            unc = artifacts["unc"]
+            probes_obj = artifacts["probes"]
+
+            embedding_key = (
+                "emb_last_tok_before_gen"
+                if args.position == "tbg"
+                else "emb_tok_before_eos"
+            )
+
+            try:
+                X, y_hall, se_raw, ids = extract_features_aligned(
+                    gens, unc,
+                    embedding_key=embedding_key,
+                    n_cap=args.n_cap,
+                    hall_acc_threshold=args.hall_acc_threshold,
+                )
+            except Exception as e:
+                print(f"[skip] {safe_model}/{dataset_name} feature extraction failed: {e}")
+                continue
+
+            # load splits + probes (from probes.pkl)
+            try:
+                splits = load_splits_from_probes(probes_obj)
+                bundle = load_probe_bundle(probes_obj, position=args.position)
+
+            except Exception as e:
+                print(f"[skip] {safe_model}/{dataset_name} probes.pkl parse failed: {e}")
+                continue
+
+            # layer sensitivity data
+            layer_results.append({
+                "Model": safe_model,
+                "Dataset": dataset_name,
+                "acc_cv_aucs": bundle.get("acc_cv_aucs", []),
+                "se_cv_aucs": bundle.get("se_cv_aucs", []),
             })
 
-            # Scores -> Risk (High = Bad)
+            # Build df with split labels
+            n = len(y_hall)
+            df = pd.DataFrame(index=np.arange(n))
+            df["split"] = "unused"
+            for k in ["train", "cal", "test"]:
+                idx = splits[k]
+                idx = idx[idx < n]  # safety if n_cap truncated
+                df.loc[idx, "split"] = k
+
+            df["y_hall"] = y_hall.astype(np.int64)
+            df["se_raw"] = se_raw.astype(np.float32)
+
+            # Probe scores using stored probe models
+            acc_layer = int(bundle["acc_best_layer"])
+            se_layer = int(bundle["se_best_layer"])
+            acc_model = bundle["acc_model"]
+            se_model = bundle["se_model"]
+
+            # Make sure layer indices are in range (defensive)
+            acc_layer = max(0, min(acc_layer, X.shape[0] - 1))
+            se_layer = max(0, min(se_layer, X.shape[0] - 1))
+
+            df["p_correct"] = acc_model.predict_proba(X[acc_layer])[:, 1].astype(np.float32)
+            df["p_high_entropy"] = se_model.predict_proba(X[se_layer])[:, 1].astype(np.float32)
+
+            # Train combiners on TRAIN only (no leakage into cal/test)
+            train_df = df[df["split"] == "train"]
+            X_train = train_df[["p_correct", "p_high_entropy"]]
+            y_train = train_df["y_hall"]
+
+            combiners = {
+                "LR": make_pipeline(StandardScaler(), LogisticRegression(max_iter=300)),
+                "MLP": make_pipeline(StandardScaler(), MLPClassifier(hidden_layer_sizes=(32,), max_iter=500, random_state=42)),
+                # "GBM": GradientBoostingClassifier(n_estimators=200, max_depth=3, random_state=42),
+            }
+            fitted_combiners = {}
+
+            for name, model in combiners.items():
+                if len(np.unique(y_train)) < 2:
+                    df[f"p_halluc_{name}"] = 0.5
+                    fitted_combiners[name] = None
+                else:
+                    model.fit(X_train, y_train)
+                    df[f"p_halluc_{name}"] = model.predict_proba(df[["p_correct", "p_high_entropy"]])[:, 1].astype(np.float32)
+                    fitted_combiners[name] = model
+
+            # Risk scores (lower = safer)
             df["score_SE"] = df["se_raw"]
             df["score_Acc"] = 1.0 - df["p_correct"]
             df["score_SE_Probe"] = df["p_high_entropy"]
             df["score_Comb_LR"] = df["p_halluc_LR"]
             df["score_Comb_MLP"] = df["p_halluc_MLP"]
-            # df["score_Comb_GBM"] = df["p_halluc_GBM"]
 
             method_map = {
                 "Semantic Entropy": "score_SE",
@@ -900,90 +994,111 @@ def main():
                 "SE Probe": "score_SE_Probe",
                 "Combined (LR)": "score_Comb_LR",
                 "Combined (MLP)": "score_Comb_MLP",
-                # "Combined (GBM)": "score_Comb_GBM"
             }
 
-            curve_data[safe_model][dataset_name] = {}
             df_test = df[df["split"] == "test"].copy()
-            df_conf = df_test[df_test["se_raw"] <= df_test["se_raw"].quantile(0.3)].copy()
+            if df_test.empty:
+                continue
 
-            # Store base risk for plotting Ideal line later
-            # (Just grab it once per dataset)
-            base_risks[(safe_model, dataset_name)] = df_test["y_hall"].mean()
+            # confident subset defined on test only
+            q30 = df_test["se_raw"].quantile(0.30)
+            df_conf = df_test[df_test["se_raw"] <= q30].copy()
+
+            curve_data[safe_model][dataset_name] = {}
+            base_risks[(safe_model, dataset_name)] = float(df_test["y_hall"].mean())
+
+            # Metrics + curves + AURC + calibration sweeps
+            dense_alphas = np.linspace(0.005, 0.4, 40)
+            table_alphas = np.array([0.05, 0.10, 0.20, 0.25])
+            all_alphas = np.unique(np.sort(np.concatenate([dense_alphas, table_alphas])))
 
             for m_name, col in method_map.items():
                 # AUROC
                 try:
                     auc_full = roc_auc_score(df_test["y_hall"], df_test[col])
-                except: auc_full = 0.5
-                
+                except Exception:
+                    auc_full = 0.5
+
                 try:
                     if len(df_conf) > 0 and len(np.unique(df_conf["y_hall"])) > 1:
                         auc_conf = roc_auc_score(df_conf["y_hall"], df_conf[col])
-                    else: auc_conf = 0.5
-                except: auc_conf = 0.5
-                
-                det_results.append({"Model": safe_model, "Dataset": dataset_name, "Method": m_name, "Subset": "Full", "AUROC": auc_full})
-                det_results.append({"Model": safe_model, "Dataset": dataset_name, "Method": m_name, "Subset": "Confident", "AUROC": auc_conf})
+                    else:
+                        auc_conf = 0.5
+                except Exception:
+                    auc_conf = 0.5
 
-                # Curves
+                det_results.append({"Model": safe_model, "Dataset": dataset_name, "Method": m_name, "Subset": "Full", "AUROC": float(auc_full)})
+                det_results.append({"Model": safe_model, "Dataset": dataset_name, "Method": m_name, "Subset": "Confident", "AUROC": float(auc_conf)})
+
+                # risk-coverage curve (test)
                 covs, risks = get_risk_coverage_curve(df_test, col)
                 curve_data[safe_model][dataset_name][m_name] = (covs, risks)
 
-                # Integrating Risk w.r.t Coverage.
-                # Ensure sorted by coverage for integration (get_risk_coverage_curve returns sorted covs)
-                # We use trapezoidal rule.
-                # AURC = Area under curve. Lower is better.
-                aurc_val = np.trapezoid(risks, covs)
-                aurc_results.append({
-                    "Model": safe_model, "Dataset": dataset_name, 
-                    "Method": m_name, "AURC": aurc_val
-                })
+                # AURC
+                aurc_val = float(np.trapezoid(risks, covs)) if len(covs) > 1 else float("nan")
+                aurc_results.append({"Model": safe_model, "Dataset": dataset_name, "Method": m_name, "AURC": aurc_val})
 
-                # Conformal Calibration
-                # Use a dense grid for smooth plots (0.5% to 40% risk)
-                dense_alphas = np.linspace(0.005, 0.4, 40)
-                
-                # Ensure we include the specific table alphas so they aren't interpolated
-                table_alphas = np.array([0.05, 0.1, 0.2, 0.25])
-                all_alphas = np.unique(np.sort(np.concatenate([dense_alphas, table_alphas])))
-
+                # calibration: threshold on cal, evaluate on test
                 for alpha in all_alphas:
-                    r, c = eval_conformal(df, col, float(alpha), args.delta, args.use_ucb)
+                    r, c = eval_calibration(df, col, float(alpha), args.delta, args.use_ucb)
                     cal_results.append({
-                        "Model": safe_model, "Dataset": dataset_name, "Method": m_name,
-                        "Target": float(alpha), "Realized": r, "Coverage": c
+                        "Model": safe_model,
+                        "Dataset": dataset_name,
+                        "Method": m_name,
+                        "Target": float(alpha),
+                        "Realized": float(r),
+                        "Coverage": float(c),
                     })
-            
-            
 
-            plot_decision_boundary(
-                df, safe_model, dataset_name, alpha=0.1, delta=args.delta, 
-                use_ucb=args.use_ucb, 
-                out_path=figures_dir / f"boundary_{safe_model}_{dataset_name}.png",
-                combiner_type=args.decision_plot_method
-            )
+            # Decision boundary plot for requested combiner
+            dm = args.decision_plot_method
+            if dm in ["LR", "MLP"]:
+                comb = fitted_combiners.get(dm)
+                if comb is not None:
+                    score_col = "score_Comb_LR" if dm == "LR" else "score_Comb_MLP"
+                    out_path = figures_dir / f"boundary_{safe_model}_{dataset_name}_{dm}.png"
+                    plot_decision_boundary(
+                        df=df,
+                        combiner_model=comb,
+                        score_col=score_col,
+                        alpha=float(args.decision_plot_alpha),
+                        delta=args.delta,
+                        use_ucb=args.use_ucb,
+                        out_path=out_path,
+                        title=f"{safe_model} / {dataset_name} — Decision Boundary ({dm})",
+                    )
 
+    # Save CSVs
     df_det = pd.DataFrame(det_results)
     df_cal = pd.DataFrame(cal_results)
+    df_aurc = pd.DataFrame(aurc_results)
+
     df_det.to_csv(figures_dir / "auroc_summary.csv", index=False)
     df_cal.to_csv(figures_dir / "calibration_summary.csv", index=False)
-    # Save AURC CSV
-    df_aurc = pd.DataFrame(aurc_results)
     df_aurc.to_csv(figures_dir / "aurc_summary.csv", index=False)
 
-    print("Generating Plots...")
-    plot_detection_bars(df_det, figures_dir)
-    plot_layer_sensitivity(layer_results_list, figures_dir)
-    plot_risk_coverage(curve_data, figures_dir, base_risks)
-    plot_calibration_curves(df_cal, figures_dir)
-    
-    print("Generating Tables...")
-    write_conformal_tables(df_cal, figures_dir, [0.05, 0.1, 0.2, 0.25])
-    write_auroc_table(df_det, figures_dir)
-    write_aurc_table(df_aurc, figures_dir)
-    
+    # Plots
+    print("Generating plots...")
+    if not df_det.empty:
+        plot_detection_bars(df_det, figures_dir)
+    if layer_results:
+        plot_layer_sensitivity(layer_results, figures_dir)
+    if curve_data:
+        plot_risk_coverage(curve_data, figures_dir, base_risks)
+    if not df_cal.empty:
+        plot_calibration_curves(df_cal, figures_dir)
+
+    # Tables
+    print("Generating LaTeX tables...")
+    if not df_det.empty:
+        write_auroc_table(df_det, figures_dir)
+    if not df_aurc.empty:
+        write_aurc_table(df_aurc, figures_dir)
+    if not df_cal.empty:
+        write_calibration_tables(df_cal, figures_dir, [0.05, 0.10, 0.20, 0.25])
+
     print(f"Done! Artifacts saved to: {figures_dir}")
+
 
 if __name__ == "__main__":
     main()
