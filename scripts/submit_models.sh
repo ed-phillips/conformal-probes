@@ -7,7 +7,12 @@ MODELS=(
     "HuggingFaceTB/SmolLM3-3B"
     "Qwen/Qwen3-4B-Instruct-2507"
     "google/gemma-3-4b-it"
-    "mistralai/Ministral-3-3B-Instruct-2512"
+    "google/gemma-7b-it"
+    # "mistralai/Ministral-3-3B-Instruct-2512"
+    "meta-llama/Llama-3.1-8B-Instruct"
+    # "mistralai/Ministral-3-8B-Instruct-2512"
+    "mistralai/Ministral-8B-Instruct-2410"
+    "Qwen/Qwen3-8B"
 )
 
 # Base path to your script
