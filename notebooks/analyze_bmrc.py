@@ -34,7 +34,7 @@ import torch
 
 import matplotlib.pyplot as plt
 import seaborn as sns
-
+from scipy.stats import pearsonr
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import LogisticRegression
@@ -410,6 +410,35 @@ def get_risk_coverage_curve(df_test: pd.DataFrame, score_col: str) -> Tuple[List
 
     return list(cov), list(risk)
 
+def compute_normalized_aurcc(cov: List[float], risk: List[float], base_risk: float) -> float:
+    """
+    Computes Normalized AURCC (nAURCC).
+    nAURCC = (AURCC - AURCC_oracle) / (AURCC_worst - AURCC_oracle)
+    Lower is better. 0 = Oracle, 1 = Random/Worst.
+    """
+    if len(cov) < 2:
+        return float("nan")
+
+    aurcc_actual = np.trapezoid(risk, cov)
+
+    # Oracle: Risk is 0 until coverage > (1-base_risk), then rises linearly
+    # Points: (0,0) -> (1-base_risk, 0) -> (1, base_risk)
+    cov_oracle = [0.0, max(0.0, 1.0 - base_risk), 1.0]
+    risk_oracle = [0.0, 0.0, base_risk]
+    aurcc_oracle = np.trapezoid(risk_oracle, cov_oracle)
+
+    # Worst (Inverse Oracle): Risk starts at 1.0 until hallucinations exhausted
+    # Points: (0,1) -> (base_risk, 1) -> (1, base_risk)
+    cov_worst = [0.0, base_risk, 1.0]
+    risk_worst = [1.0, 1.0, base_risk]
+    aurcc_worst = np.trapezoid(risk_worst, cov_worst)
+
+    denom = aurcc_worst - aurcc_oracle
+    if denom < 1e-9:
+        return 0.0
+    
+    return (aurcc_actual - aurcc_oracle) / denom
+
 
 # -----------------------------
 # Plotting
@@ -624,6 +653,41 @@ def plot_decision_boundary(
     plt.savefig(out_path, dpi=300)
     plt.close()
 
+def plot_correlation_scatter(df: pd.DataFrame, model_name: str, ds_name: str, out_path: Path):
+    """
+    Plots Semantic Entropy vs Accuracy Probe Score.
+    Highlights the 'Confidently Wrong' quadrant.
+    """
+    plt.figure(figsize=(7, 6))
+    
+    # Add jitter to SE because it often clamps to 0
+    se_jitter = df["se_raw"] + np.random.normal(0, 0.005, size=len(df))
+    
+    # Scatter points
+    sns.scatterplot(
+        x=se_jitter, 
+        y=df["p_correct"], 
+        hue=df["y_hall"],
+        palette={0: "#2ecc71", 1: "#e74c3c"}, # Green/Red
+        style=df["y_hall"],
+        markers={0: "o", 1: "X"},
+        alpha=0.6,
+        s=40
+    )
+    
+    plt.axvline(x=0.05, color='gray', linestyle='--', alpha=0.5, label="Low Entropy")
+    plt.xlabel("Semantic Entropy (Jittered)")
+    plt.ylabel("Accuracy Probe ($P_{correct}$)")
+    plt.title(f"{model_name}\n{ds_name}")
+    
+    # Highlight Confidently Wrong Region (Low Entropy, Low P_correct, Hallucination)
+    # Just an annotation
+    plt.text(0.05, 0.1, "Confidently\nWrong", color='red', fontsize=12, fontweight='bold')
+    
+    plt.legend(title="Hallucination")
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=300)
+    plt.close()
 
 # -----------------------------
 # LaTeX Tables
@@ -810,6 +874,82 @@ def write_calibration_tables(df_cal: pd.DataFrame, figures_dir: Path, table_alph
             f.write("\n".join(lines))
 
 
+def write_naurcc_table(df_aurc: pd.DataFrame, figures_dir: Path) -> None:
+    """Writes the normalized AURCC table."""
+    df = df_aurc[df_aurc["Method"].isin(METHOD_ORDER)].copy()
+    if df.empty: return
+
+    datasets = sorted(df["Dataset"].unique())
+    models = sorted(df["Model"].unique())
+    
+    # Find best (min) per (model, dataset)
+    winners = {}
+    for model in models:
+        for ds in datasets:
+            sd = df[(df["Model"] == model) & (df["Dataset"] == ds)]
+            winners[(model, ds)] = sd["nAURCC"].min() if not sd.empty else 1e9
+
+    lines = []
+    col_spec = "l" + "c" * len(datasets)
+    lines.append(rf"\begin{{tabular}}{{{col_spec}}}")
+    lines.append(r"\toprule")
+    lines.append(r"\textbf{Method} & " + " & ".join([rf"\textbf{{{latex_escape(ds)}}}" for ds in datasets]) + r" \\")
+    lines.append(r"\midrule")
+
+    for model in models:
+        lines.append(rf"\multicolumn{{{1 + len(datasets)}}}{{l}}{{\textbf{{{latex_escape(model)}}}}} \\")
+        for method in METHOD_ORDER:
+            row = [latex_escape(method)]
+            for ds in datasets:
+                v = df[(df["Model"] == model) & (df["Dataset"] == ds) & (df["Method"] == method)]["nAURCC"]
+                if v.empty:
+                    row.append("-")
+                else:
+                    val = float(v.iloc[0])
+                    s = f"{val:.3f}"
+                    if float(v.iloc[0]) <= winners.get((model, ds), 1e9) + 1e-6:
+                        s = rf"\textbf{{{s}}}"
+                    row.append(s)
+            lines.append(" & ".join(row) + r" \\")
+        lines.append(r"\addlinespace")
+    
+    lines.append(r"\bottomrule")
+    lines.append(r"\end{tabular}")
+    
+    with open(figures_dir / "naurcc_table.tex", "w") as f:
+        f.write("\n".join(lines))
+
+def write_correlation_table(df_corr: pd.DataFrame, figures_dir: Path) -> None:
+    """Writes a summary table of Pearson correlations between SE and Acc Probe."""
+    if df_corr.empty: return
+
+    datasets = sorted(df_corr["Dataset"].unique())
+    models = sorted(df_corr["Model"].unique())
+
+    lines = []
+    col_spec = "l" + "c" * len(datasets)
+    lines.append(rf"\begin{{tabular}}{{{col_spec}}}")
+    lines.append(r"\toprule")
+    lines.append(r"\textbf{Model} & " + " & ".join([rf"\textbf{{{latex_escape(ds)}}}" for ds in datasets]) + r" \\")
+    lines.append(r"\midrule")
+
+    for model in models:
+        lines.append(rf"\textbf{{{latex_escape(model)}}}")
+        row = []
+        for ds in datasets:
+            val = df_corr[(df_corr["Model"] == model) & (df_corr["Dataset"] == ds)]["Correlation"]
+            if val.empty:
+                row.append("-")
+            else:
+                row.append(f"{val.iloc[0]:.2f}")
+        lines.append(" & " + " & ".join(row) + r" \\")
+    
+    lines.append(r"\bottomrule")
+    lines.append(r"\end{tabular}")
+
+    with open(figures_dir / "correlation_table.tex", "w") as f:
+        f.write("\n".join(lines))
+
 # -----------------------------
 # Main
 # -----------------------------
@@ -870,6 +1010,7 @@ def main():
     layer_results = []
     curve_data: Dict[str, Dict[str, Dict[str, Tuple[List[float], List[float]]]]] = {}
     aurc_results = []
+    corr_results = [] 
     base_risks = {}
 
     print(f"Scanning {runs_root} ...")
@@ -1000,6 +1141,25 @@ def main():
             if df_test.empty:
                 continue
 
+            # Calculate Correlation (Test Set)
+            if not df_test.empty:
+                corr, _ = pearsonr(df_test["score_Acc"], df_test["score_SE"]) # Note: check signs. 
+                # score_Acc is risk (1-p), score_SE is risk. Should be positive correlation.
+
+    
+                corr_results.append({
+                    "Model": safe_model,
+                    "Dataset": dataset_name,
+                    "Correlation": corr
+                })
+                
+                # Save scatter plot for the first dataset or specific ones
+                if dataset_name == "trivia_qa":  # or always
+                    plot_correlation_scatter(
+                        df_test, safe_model, dataset_name, 
+                        figures_dir / f"scatter_{safe_model}_{dataset_name}.png"
+                    )
+
             # confident subset defined on test only
             q30 = df_test["se_raw"].quantile(0.30)
             df_conf = df_test[df_test["se_raw"] <= q30].copy()
@@ -1034,9 +1194,22 @@ def main():
                 covs, risks = get_risk_coverage_curve(df_test, col)
                 curve_data[safe_model][dataset_name][m_name] = (covs, risks)
 
-                # AURC
+                base_risk = base_risks[(safe_model, dataset_name)]
+
+                # AURC raw
                 aurc_val = float(np.trapezoid(risks, covs)) if len(covs) > 1 else float("nan")
-                aurc_results.append({"Model": safe_model, "Dataset": dataset_name, "Method": m_name, "AURC": aurc_val})
+
+                # Compute Normalized AURCC
+                naurc_val = compute_normalized_aurcc(covs, risks, base_risk)
+
+                aurc_results.append({
+                    "Model": safe_model, 
+                    "Dataset": dataset_name, 
+                    "Method": m_name, 
+                    "AURC": aurc_val,
+                    "nAURCC": naurc_val,
+                    "Correlation": corr  # Save correlation to this row (repeated)
+                })
 
                 # calibration: threshold on cal, evaluate on test
                 for alpha in all_alphas:
@@ -1072,10 +1245,12 @@ def main():
     df_det = pd.DataFrame(det_results)
     df_cal = pd.DataFrame(cal_results)
     df_aurc = pd.DataFrame(aurc_results)
+    df_corr = pd.DataFrame(corr_results) 
 
     df_det.to_csv(figures_dir / "auroc_summary.csv", index=False)
     df_cal.to_csv(figures_dir / "calibration_summary.csv", index=False)
     df_aurc.to_csv(figures_dir / "aurc_summary.csv", index=False)
+    df_corr.to_csv(figures_dir / "correlation_summary.csv", index=False)
 
     # Plots
     print("Generating plots...")
@@ -1094,8 +1269,12 @@ def main():
         write_auroc_table(df_det, figures_dir)
     if not df_aurc.empty:
         write_aurc_table(df_aurc, figures_dir)
+        write_naurcc_table(df_aurc, figures_dir)
     if not df_cal.empty:
         write_calibration_tables(df_cal, figures_dir, [0.05, 0.10, 0.20, 0.25])
+    if not df_corr.empty:       
+        write_correlation_table(df_corr, figures_dir)
+        
 
     print(f"Done! Artifacts saved to: {figures_dir}")
 
