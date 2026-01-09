@@ -1039,6 +1039,127 @@ def write_correlation_table(df_corr: pd.DataFrame, figures_dir: Path) -> None:
     with open(figures_dir / "correlation_table.tex", "w") as f:
         f.write("\n".join(lines))
 
+def write_calibration_error_table(df_cal: pd.DataFrame, figures_dir: Path, included_datasets: Optional[List[str]] = None) -> None:
+    """
+    Writes a table comparing Calibration Error (MACE) and Safety Violation (Max Excess Risk).
+    Robust to cases where one mode (e.g. UCB) yields 0 coverage and is filtered out.
+    """
+    # Filter for valid coverage
+    df = df_cal[df_cal["Coverage"] > 0.001].copy()
+    if df.empty: return
+
+    # Determine which datasets to process
+    available_datasets = sorted(df["Dataset"].unique())
+    if included_datasets is not None:
+        datasets = [d for d in available_datasets if d in included_datasets]
+        if not datasets:
+            print(f"Warning: No matching datasets found for calibration table. Available: {available_datasets}")
+            return
+    else:
+        datasets = available_datasets
+
+    models = sorted(df["Model"].unique())
+    
+    # Pre-calculate stats
+    stats = {}
+    
+    for m in models:
+        stats[m] = {}
+        for d in datasets:
+            stats[m][d] = {}
+            for meth in METHOD_ORDER:
+                subset = df[(df["Model"] == m) & (df["Dataset"] == d) & (df["Method"] == meth)]
+                
+                res = {}
+                for mode in ["Empirical", "Conservative"]:
+                    sub_mode = subset[subset["CalMode"] == mode]
+                    if sub_mode.empty:
+                        res[mode] = (np.nan, np.nan)
+                    else:
+                        diffs = sub_mode["Realized"] - sub_mode["Target"]
+                        mace = np.mean(np.abs(diffs))
+                        max_excess = np.max(diffs)
+                        res[mode] = (mace, max_excess)
+                
+                stats[m][d][meth] = res
+
+    # --- Write LaTeX ---
+    lines = []
+    lines.append(r"\begin{tabular}{l|cc|cc}")
+    lines.append(r"\toprule")
+    lines.append(r"& \multicolumn{2}{c|}{\textbf{Target Adherence (Empirical)}} & \multicolumn{2}{c}{\textbf{Strict Safety (UCB)}} \\")
+    lines.append(r"\textbf{Method} & \textbf{MACE} $\downarrow$ & \textbf{Max Excess} $\downarrow$ & \textbf{MACE} & \textbf{Max Excess} $\downarrow$ \\")
+    lines.append(r"\midrule")
+
+    # Helper for formatting
+    def fmt_excess(val):
+        if np.isnan(val): return "-"
+        s = f"{val:+.3f}"
+        if val > 0.005: return rf"\textcolor{{red}}{{{s}}}" 
+        if val < 0: return rf"\textcolor{{blue}}{{{s}}}"
+        return s
+
+    for m in models:
+        lines.append(rf"\multicolumn{{5}}{{l}}{{\textbf{{{latex_escape(m)}}}}} \\")
+        
+        for meth in METHOD_ORDER:
+            mace_emp_vals = []
+            exc_emp_vals = []
+            mace_ucb_vals = []
+            exc_ucb_vals = []
+            
+            for d in datasets:
+                if meth in stats[m][d]:
+                    e_m, e_x = stats[m][d][meth]["Empirical"]
+                    u_m, u_x = stats[m][d][meth]["Conservative"]
+                    
+                    if not np.isnan(e_m):
+                        mace_emp_vals.append(e_m)
+                        exc_emp_vals.append(e_x)
+                    if not np.isnan(u_m):
+                        mace_ucb_vals.append(u_m)
+                        exc_ucb_vals.append(u_x)
+
+            # Skip row only if BOTH modes are empty
+            if not mace_emp_vals and not mace_ucb_vals:
+                continue
+
+            # Compute Empirical Stats
+            if mace_emp_vals:
+                avg_mace_emp = np.mean(mace_emp_vals)
+                max_exc_emp = np.max(exc_emp_vals)
+                str_mace_emp = f"{avg_mace_emp:.3f}"
+                str_exc_emp = fmt_excess(max_exc_emp)
+            else:
+                str_mace_emp = "-"
+                str_exc_emp = "-"
+
+            # Compute UCB Stats (Handle empty case safely)
+            if mace_ucb_vals:
+                avg_mace_ucb = np.mean(mace_ucb_vals)
+                max_exc_ucb = np.max(exc_ucb_vals)
+                str_mace_ucb = f"{avg_mace_ucb:.3f}"
+                str_exc_ucb = fmt_excess(max_exc_ucb)
+            else:
+                str_mace_ucb = "-"
+                str_exc_ucb = "-"
+
+            row = [
+                latex_escape(meth),
+                str_mace_emp,
+                str_exc_emp,
+                str_mace_ucb,
+                str_exc_ucb
+            ]
+            lines.append(" & ".join(row) + r" \\")
+        lines.append(r"\addlinespace")
+
+    lines.append(r"\bottomrule")
+    lines.append(r"\end{tabular}")
+
+    with open(figures_dir / "calibration_error_table.tex", "w") as f:
+        f.write("\n".join(lines))
+
 # -----------------------------
 # Main
 # -----------------------------
@@ -1257,8 +1378,8 @@ def main():
             base_risks[(safe_model, dataset_name)] = float(df_test["y_hall"].mean())
 
             # Metrics + curves + AURC + calibration sweeps
-            dense_alphas = np.linspace(0.005, 0.4, 40)
-            table_alphas = np.array([0.05, 0.10, 0.20, 0.25])
+            dense_alphas = np.linspace(0.05, 0.4, 40)
+            table_alphas = np.array([])
             all_alphas = np.unique(np.sort(np.concatenate([dense_alphas, table_alphas])))
 
             for m_name, col in method_map.items():
@@ -1310,16 +1431,21 @@ def main():
                 })
 
                 # calibration: threshold on cal, evaluate on test
-                for alpha in all_alphas:
-                    r, c = eval_calibration(df, col, float(alpha), args.delta, args.use_ucb)
-                    cal_results.append({
-                        "Model": safe_model,
-                        "Dataset": dataset_name,
-                        "Method": m_name,
-                        "Target": float(alpha),
-                        "Realized": float(r),
-                        "Coverage": float(c),
-                    })
+
+                # Run Calibration TWICE
+                modes = [("Empirical", False), ("Conservative", True)]
+                for mode_name, use_ucb_flag in modes:
+                    for alpha in all_alphas:
+                        r, c = eval_calibration(df, col, float(alpha), args.delta, use_ucb=use_ucb_flag)
+                        cal_results.append({
+                            "Model": safe_model,
+                            "Dataset": dataset_name,
+                            "Method": m_name,
+                            "Target": float(alpha),
+                            "CalMode": mode_name,
+                            "Realized": float(r),
+                            "Coverage": float(c),
+                        })
 
             # Decision boundary plot for requested combiner
             dm = args.decision_plot_method
@@ -1369,7 +1495,9 @@ def main():
         write_aurc_table(df_aurc, figures_dir)
         write_naurcc_table(df_aurc, figures_dir)
     if not df_cal.empty:
-        write_calibration_tables(df_cal, figures_dir, [0.05, 0.10, 0.20, 0.25])
+        # write_calibration_tables(df_cal, figures_dir, [0.05, 0.10, 0.20, 0.25])
+        write_calibration_error_table(df_cal, figures_dir,
+                                      included_datasets=["trivia_qa"])
     if not df_corr.empty:       
         write_correlation_table(df_corr, figures_dir)
         
