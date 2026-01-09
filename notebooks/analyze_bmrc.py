@@ -888,47 +888,123 @@ def write_calibration_tables(df_cal: pd.DataFrame, figures_dir: Path, table_alph
 
 
 def write_naurcc_table(df_aurc: pd.DataFrame, figures_dir: Path) -> None:
-    """Writes the normalized AURCC table."""
+    """
+    Writes nAURCC table with:
+    1. Values per (Model, Dataset)
+    2. Row Average (Per Model, across Datasets)
+    3. Bottom Block: Column Averages (Across Models) & Grand Mean
+    
+    * No percentage conversion.
+    * 3 decimal places.
+    """
     df = df_aurc[df_aurc["Method"].isin(METHOD_ORDER)].copy()
     if df.empty: return
 
+    # Use raw nAURCC values (0 to 1 scale)
+    value_col = "nAURCC"
+
     datasets = sorted(df["Dataset"].unique())
     models = sorted(df["Model"].unique())
-    
-    # Find best (min) per (model, dataset)
-    winners = {}
-    for model in models:
-        for ds in datasets:
-            sd = df[(df["Model"] == model) & (df["Dataset"] == ds)]
-            winners[(model, ds)] = sd["nAURCC"].min() if not sd.empty else 1e9
+    methods = [m for m in METHOD_ORDER if m in df["Method"].unique()]
 
+    # --- Pre-calculate Statistics & Winners ---
+    stats = {}
+    
+    # 1. Individual entries + Row Means
+    for m in models:
+        stats[m] = {}
+        for meth in methods:
+            stats[m][meth] = {}
+            row_vals = []
+            for d in datasets:
+                val = df[(df["Model"] == m) & (df["Dataset"] == d) & (df["Method"] == meth)][value_col]
+                if not val.empty:
+                    v = float(val.iloc[0])
+                    stats[m][meth][d] = v
+                    row_vals.append(v)
+                else:
+                    stats[m][meth][d] = float("nan")
+            
+            # Row Mean
+            stats[m][meth]["Avg"] = np.mean(row_vals) if row_vals else float("nan")
+
+    # 2. Bottom Summary (Averages across models)
+    stats["AVERAGE_ALL"] = {}
+    for meth in methods:
+        stats["AVERAGE_ALL"][meth] = {}
+        
+        all_models_vals = []
+        for d in datasets:
+            vals = df[(df["Dataset"] == d) & (df["Method"] == meth)][value_col]
+            mean_val = vals.mean() if not vals.empty else float("nan")
+            stats["AVERAGE_ALL"][meth][d] = mean_val
+            if not vals.empty: all_models_vals.extend(vals.values)
+        
+        # Grand Mean (Average of all nAURCC values for this method)
+        stats["AVERAGE_ALL"][meth]["Avg"] = np.mean(all_models_vals) if all_models_vals else float("nan")
+
+    # 3. Identify Winners (Lowest nAURCC) for bolding
+    winners = {}
+    all_model_keys = models + ["AVERAGE_ALL"]
+    all_ds_keys = datasets + ["Avg"]
+    
+    for m_key in all_model_keys:
+        for d_key in all_ds_keys:
+            best_val = 1e9
+            for meth in methods:
+                val = stats[m_key][meth].get(d_key, float("nan"))
+                if not np.isnan(val) and val < best_val:
+                    best_val = val
+            winners[(m_key, d_key)] = best_val
+
+    # --- Write LaTeX ---
     lines = []
-    col_spec = "l" + "c" * len(datasets)
+    col_spec = "l" + "c" * len(datasets) + "c"
     lines.append(rf"\begin{{tabular}}{{{col_spec}}}")
     lines.append(r"\toprule")
-    lines.append(r"\textbf{Method} & " + " & ".join([rf"\textbf{{{latex_escape(ds)}}}" for ds in datasets]) + r" \\")
+    
+    # Header
+    header = r"\textbf{Method} & " + " & ".join([rf"\textbf{{{latex_escape(ds)}}}" for ds in datasets]) + r" & \textbf{Mean} \\"
+    lines.append(header)
     lines.append(r"\midrule")
 
+    # Body: Per Model
     for model in models:
-        lines.append(rf"\multicolumn{{{1 + len(datasets)}}}{{l}}{{\textbf{{{latex_escape(model)}}}}} \\")
-        for method in METHOD_ORDER:
-            row = [latex_escape(method)]
-            for ds in datasets:
-                v = df[(df["Model"] == model) & (df["Dataset"] == ds) & (df["Method"] == method)]["nAURCC"]
-                if v.empty:
+        lines.append(rf"\multicolumn{{{len(datasets) + 2}}}{{l}}{{\textbf{{{latex_escape(model)}}}}} \\")
+        for meth in methods:
+            row = [latex_escape(meth)]
+            for d_key in all_ds_keys:
+                val = stats[model][meth].get(d_key, float("nan"))
+                if np.isnan(val):
                     row.append("-")
                 else:
-                    val = float(v.iloc[0])
                     s = f"{val:.3f}"
-                    if float(v.iloc[0]) <= winners.get((model, ds), 1e9) + 1e-6:
+                    # Bold if within epsilon of winner
+                    if val <= winners[(model, d_key)] + 1e-6:
                         s = rf"\textbf{{{s}}}"
                     row.append(s)
             lines.append(" & ".join(row) + r" \\")
         lines.append(r"\addlinespace")
-    
+
+    # Bottom: Overall Average
+    lines.append(r"\midrule")
+    lines.append(rf"\multicolumn{{{len(datasets) + 2}}}{{l}}{{\textbf{{Overall Average (Across Models)}}}} \\")
+    for meth in methods:
+        row = [latex_escape(meth)]
+        for d_key in all_ds_keys:
+            val = stats["AVERAGE_ALL"][meth].get(d_key, float("nan"))
+            if np.isnan(val):
+                row.append("-")
+            else:
+                s = f"{val:.3f}"
+                if val <= winners[("AVERAGE_ALL", d_key)] + 1e-6:
+                    s = rf"\textbf{{{s}}}"
+                row.append(s)
+        lines.append(" & ".join(row) + r" \\")
+
     lines.append(r"\bottomrule")
     lines.append(r"\end{tabular}")
-    
+
     with open(figures_dir / "naurcc_table.tex", "w") as f:
         f.write("\n".join(lines))
 
