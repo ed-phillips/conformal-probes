@@ -40,7 +40,7 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import LogisticRegression
 from sklearn.neural_network import MLPClassifier
 from sklearn.ensemble import GradientBoostingClassifier
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import roc_auc_score, average_precision_score
 
 
 # -----------------------------
@@ -697,34 +697,44 @@ def latex_escape(s: str) -> str:
     return str(s).replace("_", r"\_").replace("%", r"\%")
 
 
-def write_auroc_table(df_det: pd.DataFrame, figures_dir: Path) -> None:
+def write_detection_table(df_det: pd.DataFrame, figures_dir: Path) -> None:
+    """
+    Writes a table comparing AUROC and AUPRC.
+    Columns: Dataset -> [AUROC, AUPRC]
+    """
     df = df_det[df_det["Method"].isin(METHOD_ORDER)].copy()
-    if df.empty:
-        return
+    if df.empty: return
+
+    # We only care about the "Full" subset for this table now
+    df = df[df["Subset"] == "Full"]
 
     datasets = sorted(df["Dataset"].unique())
     models = sorted(df["Model"].unique())
 
+    # identify winners (max) for bolding
     winners = {}
     for model in models:
         for ds in datasets:
-            for subset in ["Full", "Confident"]:
-                sd = df[(df["Model"] == model) & (df["Dataset"] == ds) & (df["Subset"] == subset)]
-                winners[(model, ds, subset)] = sd["AUROC"].max() if not sd.empty else -1.0
+            sd = df[(df["Model"] == model) & (df["Dataset"] == ds)]
+            if not sd.empty:
+                winners[(model, ds, "AUROC")] = sd["AUROC"].max()
+                winners[(model, ds, "AUPRC")] = sd["AUPRC"].max()
 
     lines = []
     col_spec = "l" + "cc" * len(datasets)
     lines.append(rf"\begin{{tabular}}{{{col_spec}}}")
     lines.append(r"\toprule")
 
+    # Header 1: Datasets
     header_1 = [r"\textbf{Method}"]
     for ds in datasets:
         header_1.append(rf"\multicolumn{{2}}{{c}}{{\textbf{{{latex_escape(ds)}}}}}")
     lines.append(" & ".join(header_1) + r" \\")
 
+    # Header 2: Metrics
     header_2 = [r""]
     for _ in datasets:
-        header_2.extend([r"\scriptsize{Full}", r"\scriptsize{Conf}"])
+        header_2.extend([r"\scriptsize{AUROC}", r"\scriptsize{AUPRC}"])
     lines.append(" & ".join(header_2) + r" \\")
     lines.append(r"\midrule")
 
@@ -733,30 +743,33 @@ def write_auroc_table(df_det: pd.DataFrame, figures_dir: Path) -> None:
         for method in METHOD_ORDER:
             row = [latex_escape(method)]
             for ds in datasets:
-                v_full = df[(df["Model"] == model) & (df["Dataset"] == ds) & (df["Method"] == method) & (df["Subset"] == "Full")]["AUROC"]
-                v_conf = df[(df["Model"] == model) & (df["Dataset"] == ds) & (df["Method"] == method) & (df["Subset"] == "Confident")]["AUROC"]
+                # Get Full subset rows
+                row_dat = df[(df["Model"] == model) & (df["Dataset"] == ds) & (df["Method"] == method)]
+                
+                if row_dat.empty:
+                    row.extend(["-", "-"])
+                else:
+                    val_auc = float(row_dat.iloc[0]["AUROC"])
+                    val_prc = float(row_dat.iloc[0]["AUPRC"])
+                    
+                    s_auc = f"{val_auc:.3f}"
+                    s_prc = f"{val_prc:.3f}"
 
-                val_full = float(v_full.iloc[0]) if not v_full.empty else 0.0
-                val_conf = float(v_conf.iloc[0]) if not v_conf.empty else 0.0
-
-                s_full = f"{val_full:.3f}"
-                s_conf = f"{val_conf:.3f}"
-
-                if val_full >= winners.get((model, ds, "Full"), -1) - 1e-6:
-                    s_full = rf"\textbf{{{s_full}}}"
-                if val_conf >= winners.get((model, ds, "Confident"), -1) - 1e-6:
-                    s_conf = rf"\textbf{{{s_conf}}}"
-
-                row.extend([s_full, s_conf])
+                    # Bold logic
+                    if val_auc >= winners.get((model, ds, "AUROC"), -1) - 1e-6:
+                        s_auc = rf"\textbf{{{s_auc}}}"
+                    if val_prc >= winners.get((model, ds, "AUPRC"), -1) - 1e-6:
+                        s_prc = rf"\textbf{{{s_prc}}}"
+                    
+                    row.extend([s_auc, s_prc])
             lines.append(" & ".join(row) + r" \\")
         lines.append(r"\addlinespace")
 
     lines.append(r"\bottomrule")
     lines.append(r"\end{tabular}")
 
-    with open(figures_dir / "detection_auroc_table.tex", "w") as f:
+    with open(figures_dir / "detection_metrics_table.tex", "w") as f:
         f.write("\n".join(lines))
-
 
 def write_aurc_table(df_aurc: pd.DataFrame, figures_dir: Path) -> None:
     df = df_aurc[df_aurc["Method"].isin(METHOD_ORDER)].copy()
@@ -1187,7 +1200,16 @@ def main():
                 except Exception:
                     auc_conf = 0.5
 
-                det_results.append({"Model": safe_model, "Dataset": dataset_name, "Method": m_name, "Subset": "Full", "AUROC": float(auc_full)})
+                # AUPRC
+                try:
+                    # average_precision_score takes (y_true, y_score)
+                    # y_hall=1 is positive class. 
+                    # scores are risk scores (high = hallucination). This matches.
+                    auprc_full = average_precision_score(df_test["y_hall"], df_test[col])
+                except Exception:
+                    auprc_full = 0.0
+
+                det_results.append({"Model": safe_model, "Dataset": dataset_name, "Method": m_name, "Subset": "Full", "AUROC": float(auc_full),  "AUPRC": float(auprc_full)})
                 det_results.append({"Model": safe_model, "Dataset": dataset_name, "Method": m_name, "Subset": "Confident", "AUROC": float(auc_conf)})
 
                 # risk-coverage curve (test)
@@ -1266,7 +1288,7 @@ def main():
     # Tables
     print("Generating LaTeX tables...")
     if not df_det.empty:
-        write_auroc_table(df_det, figures_dir)
+        write_detection_table(df_det, figures_dir)
     if not df_aurc.empty:
         write_aurc_table(df_aurc, figures_dir)
         write_naurcc_table(df_aurc, figures_dir)
