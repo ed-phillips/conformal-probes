@@ -1053,9 +1053,9 @@ def write_correlation_table(df_corr: pd.DataFrame, df_det: pd.DataFrame, figures
     models = sorted(df_corr["Model"].unique())
     
     lines = []
-    lines.append(r"\begin{tabular}{l|c|cc|cc}")
+    lines.append(r"\begin{tabular}{lccccc}")
     lines.append(r"\toprule")
-    lines.append(r" & & \multicolumn{2}{c|}{\textbf{AUROC (All Samples)}} & \multicolumn{2}{c}{\textbf{AUROC (Confident Subset)}} \\")
+    lines.append(r" & & \multicolumn{2}{c}{\textbf{AUROC (All Samples)}} & \multicolumn{2}{c}{\textbf{AUROC (Confident Subset)}} \\")
     lines.append(r"\textbf{Model} & \textbf{Corr} & \textbf{Acc Probe} & \textbf{Sem Entropy} & \textbf{Acc Probe} & \textbf{Sem Entropy} \\")
     lines.append(r"\midrule")
 
