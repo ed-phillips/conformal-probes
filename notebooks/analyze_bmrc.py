@@ -34,7 +34,7 @@ import torch
 
 import matplotlib.pyplot as plt
 import seaborn as sns
-from scipy.stats import pearsonr
+from scipy.stats import pearsonr, spearmanr
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import LogisticRegression
@@ -537,66 +537,68 @@ def plot_risk_coverage(curve_data: dict, figures_dir: Path, base_risks: dict) ->
 
 def plot_calibration_curves(df_cal: pd.DataFrame, figures_dir: Path) -> None:
     """
-    Plots Target risk (x) vs Realized risk (y), per model, with subplots per dataset.
+    Plots Target risk (x) vs Realized risk (y).
+    One Figure per (Model, Dataset).
+    Subplots: [Empirical (Target Adherence)] [Conservative (Safety/UCB)]
     """
     unique_models = df_cal["Model"].unique()
     unique_datasets = sorted(df_cal["Dataset"].unique())
-    n_ds = len(unique_datasets)
 
     for model in unique_models:
-        model_data = df_cal[df_cal["Model"] == model]
-        if model_data.empty:
-            continue
+        for ds in unique_datasets:
+            data = df_cal[(df_cal["Model"] == model) & (df_cal["Dataset"] == ds)]
+            if data.empty:
+                continue
 
-        fig, axes = plt.subplots(1, n_ds, figsize=(5 * n_ds, 5.5), sharey=True)
-        if n_ds == 1:
-            axes = [axes]
-
-        fig.suptitle(f"Calibration (threshold on cal, eval on test): {model}", fontsize=15, y=0.98)
-
-        for i, (ax, ds) in enumerate(zip(axes, unique_datasets)):
-            ds_data = model_data[model_data["Dataset"] == ds]
-
-            ax.plot([0, 1], [0, 1], "k--", alpha=0.5, linewidth=1.5)
-
-            if not ds_data.empty:
+            fig, axes = plt.subplots(1, 2, figsize=(12, 5), sharey=True)
+            
+            # Subplot 1: Empirical
+            ax_emp = axes[0]
+            data_emp = data[data["CalMode"] == "Empirical"]
+            
+            ax_emp.plot([0, 1], [0, 1], "k--", alpha=0.4, linewidth=1)
+            if not data_emp.empty:
                 sns.lineplot(
-                    data=ds_data,
-                    x="Target",
-                    y="Realized",
-                    hue="Method",
-                    palette=COLORS,
-                    linewidth=2.5,
-                    ax=ax,
-                    legend=False,
+                    data=data_emp, x="Target", y="Realized", hue="Method",
+                    palette=COLORS, linewidth=2.5, ax=ax_emp, estimator=None
                 )
+            ax_emp.set_title("Target Adherence (Empirical)")
+            ax_emp.set_xlabel(r"Target Risk ($\alpha$)")
+            ax_emp.set_ylabel("Realized Hallucination Rate")
+            ax_emp.set_xlim(0, 0.4)
+            ax_emp.set_ylim(0, 0.4)
+            ax_emp.grid(True, alpha=0.3)
+            ax_emp.get_legend().remove()
 
-            ax.set_title(ds)
-            ax.set_xlabel("Target Risk ($\\alpha$)")
-            ax.set_xlim(0, 0.4)
-            ax.set_ylim(0, 0.4)
-            ax.grid(True, alpha=0.3)
-
-            if i == 0:
-                ax.set_ylabel("Realized Hallucination Rate")
-            else:
-                ax.set_ylabel("")
-
-        # unified legend
-        dummy_fig = plt.figure()
-        dummy_ax = dummy_fig.add_subplot(111)
-        sns.lineplot(data=model_data, x="Target", y="Realized", hue="Method", palette=COLORS, ax=dummy_ax)
-        handles, labels = dummy_ax.get_legend_handles_labels()
-        plt.close(dummy_fig)
-        if handles:
+            # Subplot 2: Conservative (UCB)
+            ax_ucb = axes[1]
+            data_ucb = data[data["CalMode"] == "Conservative"]
+            
+            ax_ucb.plot([0, 1], [0, 1], "k--", alpha=0.4, linewidth=1)
+            if not data_ucb.empty:
+                sns.lineplot(
+                    data=data_ucb, x="Target", y="Realized", hue="Method",
+                    palette=COLORS, linewidth=2.5, ax=ax_ucb, estimator=None
+                )
+            ax_ucb.set_title(r"Strict Safety (UCB, $\delta=0.1$)")
+            ax_ucb.set_xlabel(r"Target Risk ($\alpha$)")
+            ax_ucb.set_xlim(0, 0.4)
+            ax_ucb.set_ylim(0, 0.4)
+            ax_ucb.grid(True, alpha=0.3)
+            
+            # Unified Legend
+            handles, labels = ax_ucb.get_legend_handles_labels()
+            ax_ucb.get_legend().remove()
+            
             fig.legend(handles, labels, loc="lower center", bbox_to_anchor=(0.5, -0.05), ncol=len(labels), frameon=False)
+            
+            fig.suptitle(f"Calibration: {model} / {ds}", y=0.98, fontsize=14)
+            plt.tight_layout()
+            plt.subplots_adjust(bottom=0.2) # Make room for legend
 
-        plt.tight_layout()
-        plt.subplots_adjust(bottom=0.15)
-
-        safe_model = model.replace("/", "_")
-        plt.savefig(figures_dir / f"calibration_{safe_model}.png", dpi=300, bbox_inches="tight")
-        plt.close()
+            safe_model = model.replace("/", "_")
+            plt.savefig(figures_dir / f"calibration_{safe_model}_{ds}.png", dpi=300, bbox_inches="tight")
+            plt.close()
 
 
 def plot_decision_boundary(
@@ -655,36 +657,63 @@ def plot_decision_boundary(
 
 def plot_correlation_scatter(df: pd.DataFrame, model_name: str, ds_name: str, out_path: Path):
     """
-    Plots Semantic Entropy vs Accuracy Probe Score.
-    Highlights the 'Confidently Wrong' quadrant.
+    Plots Semantic Entropy vs Accuracy Probe Logits.
+    Clean, consistent style with other figures.
     """
-    plt.figure(figsize=(7, 6))
+    # 1. Prepare Data for Plotting
+    # Map 0/1 to strings for the Legend
+    plot_df = df.copy()
+    plot_df["Label"] = plot_df["y_hall"].map({0: "Correct", 1: "Hallucination"})
     
-    # Add jitter to SE because it often clamps to 0
-    se_jitter = df["se_raw"] + np.random.normal(0, 0.005, size=len(df))
+    # Jitter SE slightly to visualize density at 0.0
+    # Clip to [0, inf) to keep it logical
+    jitter = np.random.normal(0, 0.008, size=len(plot_df))
+    plot_df["se_jittered"] = np.clip(plot_df["se_raw"] + jitter, 0, None)
+
+    # 2. Setup Plot
+    plt.figure(figsize=(8, 6))
     
-    # Scatter points
+    # Palette: Royal Blue (Correct) vs Red/Tomato (Hallucination)
+    custom_palette = {"Correct": "#4169E1", "Hallucination": "#E74C3C"}
+
+    # 3. Scatter Plot
     sns.scatterplot(
-        x=se_jitter, 
-        y=df["p_correct"], 
-        hue=df["y_hall"],
-        palette={0: "#2ecc71", 1: "#e74c3c"}, # Green/Red
-        style=df["y_hall"],
-        markers={0: "o", 1: "X"},
-        alpha=0.6,
-        s=40
+        data=plot_df,
+        x="se_jittered",
+        y="logit_correct",
+        hue="Label",
+        style="Label",
+        markers={"Correct": "o", "Hallucination": "o"}, # Keep shape simple
+        palette=custom_palette,
+        alpha=0.5,       # Transparency is key for density
+        s=30,            # Marker size
+        edgecolor="w",   # Slight white edge helps separation
+        linewidth=0.3
     )
+
+    # 4. Reference Lines
+    # Vertical: 50th percentile SE (Confident Subset boundary)
+    q50 = plot_df["se_raw"].quantile(0.50)
+    plt.axvline(x=q50, color='black', linestyle='--', alpha=0.7, linewidth=1.5, label="50th %tile SE")
     
-    plt.axvline(x=0.05, color='gray', linestyle='--', alpha=0.5, label="Low Entropy")
-    plt.xlabel("Semantic Entropy (Jittered)")
-    plt.ylabel("Accuracy Probe ($P_{correct}$)")
-    plt.title(f"{model_name}\n{ds_name}")
+    # # Horizontal: Logit = 0 (Probe Decision Boundary)
+    # plt.axhline(y=0, color='gray', linestyle=':', alpha=0.6, linewidth=1.5)
+
+    # 5. Labels & Formatting
+    plt.xlabel("Semantic Entropy (Uncertainty)")
+    plt.ylabel(r"Accuracy Probe Logits ($\leftarrow$ Hallucination | Correct $\rightarrow$)")
+    plt.title(f"{model_name} / {ds_name}")
+
+    # Move legend to best spot, usually upper right for this distribution
+    plt.legend(title=None, loc="upper right", frameon=True, framealpha=0.95)
     
-    # Highlight Confidently Wrong Region (Low Entropy, Low P_correct, Hallucination)
-    # Just an annotation
-    plt.text(0.05, 0.1, "Confidently\nWrong", color='red', fontsize=12, fontweight='bold')
+    plt.grid(True, alpha=0.3)
+    plt.xlim(left=-0.05)
     
-    plt.legend(title="Hallucination")
+    # Adjust Y limits to offer a bit of headroom
+    y_min, y_max = plot_df["logit_correct"].min(), plot_df["logit_correct"].max()
+    plt.ylim(y_min - 0.5, y_max + 0.5)
+
     plt.tight_layout()
     plt.savefig(out_path, dpi=300)
     plt.close()
@@ -1008,44 +1037,89 @@ def write_naurcc_table(df_aurc: pd.DataFrame, figures_dir: Path) -> None:
     with open(figures_dir / "naurcc_table.tex", "w") as f:
         f.write("\n".join(lines))
 
-def write_correlation_table(df_corr: pd.DataFrame, figures_dir: Path) -> None:
-    """Writes a summary table of Pearson correlations between SE and Acc Probe."""
-    if df_corr.empty: return
+def write_correlation_table(df_corr: pd.DataFrame, df_det: pd.DataFrame, figures_dir: Path) -> None:
+    """
+    Writes Table 1: Model | Correlation | AUROC (Acc Full) | AUROC (SE Full) | AUROC (Acc Conf) | AUROC (SE Conf)
+    """
+    if df_corr.empty or df_det.empty: 
+        return
 
-    datasets = sorted(df_corr["Dataset"].unique())
+    # Average correlation across datasets per model for a cleaner summary, 
+    # OR list (Model, Dataset) rows. The paper table seemed to be per model (averaged or representative).
+    # Here we will list per Model (averaging across datasets) to match the abstract's style of "Model Performance".
+    # Alternatively, if you want every pair, change logic below. 
+    # Let's do One row per Model (Averaged across datasets) to keep it compact like the draft Table 1.
+    
     models = sorted(df_corr["Model"].unique())
-
+    
     lines = []
-    col_spec = "l" + "c" * len(datasets)
-    lines.append(rf"\begin{{tabular}}{{{col_spec}}}")
+    lines.append(r"\begin{tabular}{l|c|cc|cc}")
     lines.append(r"\toprule")
-    lines.append(r"\textbf{Model} & " + " & ".join([rf"\textbf{{{latex_escape(ds)}}}" for ds in datasets]) + r" \\")
+    lines.append(r" & & \multicolumn{2}{c|}{\textbf{AUROC (All Samples)}} & \multicolumn{2}{c}{\textbf{AUROC (Confident Subset)}} \\")
+    lines.append(r"\textbf{Model} & \textbf{Corr} & \textbf{Acc Probe} & \textbf{Sem Entropy} & \textbf{Acc Probe} & \textbf{Sem Entropy} \\")
     lines.append(r"\midrule")
 
     for model in models:
-        lines.append(rf"\textbf{{{latex_escape(model)}}}")
-        row = []
-        for ds in datasets:
-            val = df_corr[(df_corr["Model"] == model) & (df_corr["Dataset"] == ds)]["Correlation"]
-            if val.empty:
-                row.append("-")
-            else:
-                row.append(f"{val.iloc[0]:.2f}")
-        lines.append(" & " + " & ".join(row) + r" \\")
-    
+        # 1. Get average correlation
+        mean_corr = df_corr[df_corr["Model"] == model]["Correlation"].mean()
+        
+        # 2. Get AUROCs (averaged across datasets)
+        # Filter for this model
+        sub = df_det[df_det["Model"] == model]
+        
+        def get_auroc(method, subset):
+            rows = sub[(sub["Method"] == method) & (sub["Subset"] == subset)]
+            if rows.empty: return np.nan
+            return rows["AUROC"].mean()
+
+        ap_full = get_auroc("Accuracy Probe", "Full")
+        se_full = get_auroc("Semantic Entropy", "Full")
+        ap_conf = get_auroc("Accuracy Probe", "Confident")
+        se_conf = get_auroc("Semantic Entropy", "Confident")
+        
+        # Formatting
+        def fmt(val, is_bold=False):
+            if np.isnan(val): return "-"
+            s = f"{val:.2f}"
+            return rf"\textbf{{{s}}}" if is_bold else s
+
+        # Bold logic: Max in pair
+        bold_full_ap = (ap_full > se_full)
+        bold_full_se = (se_full > ap_full)
+        bold_conf_ap = (ap_conf > se_conf)
+        bold_conf_se = (se_conf > ap_conf)
+
+        row = [
+            latex_escape(model),
+            f"{mean_corr:.2f}",
+            fmt(ap_full, bold_full_ap),
+            fmt(se_full, bold_full_se),
+            fmt(ap_conf, bold_conf_ap),
+            fmt(se_conf, bold_conf_se)
+        ]
+        
+        lines.append(" & ".join(row) + r" \\")
+
     lines.append(r"\bottomrule")
     lines.append(r"\end{tabular}")
 
-    with open(figures_dir / "correlation_table.tex", "w") as f:
+    with open(figures_dir / "correlation_summary_table.tex", "w") as f:
         f.write("\n".join(lines))
+
 
 def write_calibration_error_table(df_cal: pd.DataFrame, figures_dir: Path, included_datasets: Optional[List[str]] = None) -> None:
     """
-    Writes a table comparing Calibration Error (MACE) and Safety Violation (Max Excess Risk).
-    Robust to cases where one mode (e.g. UCB) yields 0 coverage and is filtered out.
+    Writes MACE / Max Excess Risk.
+    Filters calculation to alpha in [0.05, 0.25].
     """
-    # Filter for valid coverage
-    df = df_cal[df_cal["Coverage"] > 0.001].copy()
+    # 1. Filter for valid coverage AND valid alpha range
+    # We only care about the operating window 0.05 <= alpha <= 0.25
+    df = df_cal[
+        (df_cal["Coverage"] > 0.001) & 
+        (df_cal["Target"] >= 0.049) & 
+        (df_cal["Target"] <= 0.251)
+    ].copy()
+    
     if df.empty: return
 
     # Determine which datasets to process
@@ -1053,8 +1127,7 @@ def write_calibration_error_table(df_cal: pd.DataFrame, figures_dir: Path, inclu
     if included_datasets is not None:
         datasets = [d for d in available_datasets if d in included_datasets]
         if not datasets:
-            print(f"Warning: No matching datasets found for calibration table. Available: {available_datasets}")
-            return
+            datasets = available_datasets
     else:
         datasets = available_datasets
 
@@ -1167,7 +1240,7 @@ def write_calibration_error_table(df_cal: pd.DataFrame, figures_dir: Path, inclu
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--runs-root", type=str, required=True)
-    parser.add_argument("--figures-dirname", type=str, default="analysis_output_v4")
+    parser.add_argument("--figures-dirname", type=str, default="analysis_output_v5")
     # parser.add_argument("--embedding-key", type=str, default="emb_last_tok_before_gen")
     parser.add_argument("--n-cap", type=int, default=2000)
     parser.add_argument("--hall-acc-threshold", type=float, default=0.99)
@@ -1308,8 +1381,19 @@ def main():
             acc_layer = max(0, min(acc_layer, X.shape[0] - 1))
             se_layer = max(0, min(se_layer, X.shape[0] - 1))
 
+            # --- Get Probabilities ---
             df["p_correct"] = acc_model.predict_proba(X[acc_layer])[:, 1].astype(np.float32)
             df["p_high_entropy"] = se_model.predict_proba(X[se_layer])[:, 1].astype(np.float32)
+
+            # --- Get Logits (for plotting) ---
+            # Try decision_function (cleaner), else inverse-sigmoid the probabilities
+            if hasattr(acc_model, "decision_function"):
+                df["logit_correct"] = acc_model.decision_function(X[acc_layer]).astype(np.float32)
+            else:
+                from scipy.special import logit
+                # Clip to avoid inf
+                p_clipped = df["p_correct"].clip(1e-6, 1 - 1e-6)
+                df["logit_correct"] = logit(p_clipped)
 
             # Train combiners on TRAIN only (no leakage into cal/test)
             train_df = df[df["split"] == "train"]
@@ -1353,8 +1437,9 @@ def main():
 
             # Calculate Correlation (Test Set)
             if not df_test.empty:
-                corr, _ = pearsonr(df_test["score_Acc"], df_test["score_SE"]) # Note: check signs. 
-                # score_Acc is risk (1-p), score_SE is risk. Should be positive correlation.
+                # We correlate SE (Risk) with 1-P (Risk) OR -Logit (Risk)
+                # This ensures a positive correlation coefficient.
+                corr, _ = spearmanr(df_test["score_Acc"], df_test["score_SE"])
 
     
                 corr_results.append({
@@ -1371,8 +1456,8 @@ def main():
                     )
 
             # confident subset defined on test only
-            q30 = df_test["se_raw"].quantile(0.30)
-            df_conf = df_test[df_test["se_raw"] <= q30].copy()
+            q50 = df_test["se_raw"].quantile(0.50)
+            df_conf = df_test[df_test["se_raw"] <= q50].copy()
 
             curve_data[safe_model][dataset_name] = {}
             base_risks[(safe_model, dataset_name)] = float(df_test["y_hall"].mean())
@@ -1495,11 +1580,10 @@ def main():
         write_aurc_table(df_aurc, figures_dir)
         write_naurcc_table(df_aurc, figures_dir)
     if not df_cal.empty:
-        # write_calibration_tables(df_cal, figures_dir, [0.05, 0.10, 0.20, 0.25])
         write_calibration_error_table(df_cal, figures_dir,
                                       included_datasets=["trivia_qa"])
-    if not df_corr.empty:       
-        write_correlation_table(df_corr, figures_dir)
+    if not df_corr.empty and not df_det.empty:       
+        write_correlation_table(df_corr, df_det, figures_dir)
         
 
     print(f"Done! Artifacts saved to: {figures_dir}")
