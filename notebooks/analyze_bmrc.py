@@ -726,30 +726,96 @@ def latex_escape(s: str) -> str:
     return str(s).replace("_", r"\_").replace("%", r"\%")
 
 
-def write_detection_table(df_det: pd.DataFrame, figures_dir: Path) -> None:
+def write_detection_table(df_det: pd.DataFrame, base_risks: Dict[Tuple[str, str], float], figures_dir: Path) -> None:
     """
-    Writes a table comparing AUROC and AUPRC.
-    Columns: Dataset -> [AUROC, AUPRC]
+    Writes detection metrics table (AUROC / AUPRC).
+    - Rows: Methods grouped by Model.
+    - Columns: Datasets (AUROC, AUPRC).
+    - Extra:
+      1. Model Header shows Base Accuracy (1 - base_risk).
+      2. Bottom block shows Average across models.
+      3. Bold = Best Overall. Italic = Best Single-Pass (non-SE).
     """
     df = df_det[df_det["Method"].isin(METHOD_ORDER)].copy()
     if df.empty: return
 
-    # We only care about the "Full" subset for this table now
+    # Filter to Full subset only
     df = df[df["Subset"] == "Full"]
 
     datasets = sorted(df["Dataset"].unique())
     models = sorted(df["Model"].unique())
+    methods = [m for m in METHOD_ORDER if m in df["Method"].unique()]
+    
+    # Define Single-Pass methods for italics logic
+    single_pass_methods = [m for m in methods if m != "Semantic Entropy"]
 
-    # identify winners (max) for bolding
-    winners = {}
-    for model in models:
+    # --- Pre-calculate Stats & Winners ---
+    # Structure: stats[model_key][method][dataset] = {AUROC: x, AUPRC: y}
+    # model_key can be a specific model name or "AVERAGE_ALL"
+    stats = {}
+
+    # 1. Individual Models
+    for m in models:
+        stats[m] = {}
+        for meth in methods:
+            stats[m][meth] = {}
+            for ds in datasets:
+                row = df[(df["Model"] == m) & (df["Dataset"] == ds) & (df["Method"] == meth)]
+                if not row.empty:
+                    stats[m][meth][ds] = {
+                        "AUROC": float(row.iloc[0]["AUROC"]),
+                        "AUPRC": float(row.iloc[0]["AUPRC"])
+                    }
+                else:
+                    stats[m][meth][ds] = None
+
+    # 2. Averages
+    stats["AVERAGE_ALL"] = {}
+    for meth in methods:
+        stats["AVERAGE_ALL"][meth] = {}
         for ds in datasets:
-            sd = df[(df["Model"] == model) & (df["Dataset"] == ds)]
-            if not sd.empty:
-                winners[(model, ds, "AUROC")] = sd["AUROC"].max()
-                winners[(model, ds, "AUPRC")] = sd["AUPRC"].max()
+            # Gather all model values for this method/dataset
+            aurocs = []
+            auprcs = []
+            for m in models:
+                val = stats[m][meth][ds]
+                if val:
+                    aurocs.append(val["AUROC"])
+                    auprcs.append(val["AUPRC"])
+            
+            if aurocs:
+                stats["AVERAGE_ALL"][meth][ds] = {
+                    "AUROC": np.mean(aurocs),
+                    "AUPRC": np.mean(auprcs)
+                }
+            else:
+                stats["AVERAGE_ALL"][meth][ds] = None
 
+    # 3. Identify Winners (Max)
+    # winners[context_key][dataset][metric] = {overall_max: x, single_pass_max: y}
+    winners = {}
+    all_contexts = models + ["AVERAGE_ALL"]
+    
+    for ctx in all_contexts:
+        winners[ctx] = {}
+        for ds in datasets:
+            winners[ctx][ds] = {"AUROC": {"all": -1, "sp": -1}, "AUPRC": {"all": -1, "sp": -1}}
+            
+            # Find maxes
+            for metric in ["AUROC", "AUPRC"]:
+                # Overall Max
+                valid_vals = [stats[ctx][m][ds][metric] for m in methods if stats[ctx][m][ds] is not None]
+                if valid_vals:
+                    winners[ctx][ds][metric]["all"] = max(valid_vals)
+                
+                # Single Pass Max
+                valid_sp = [stats[ctx][m][ds][metric] for m in single_pass_methods if stats[ctx][m][ds] is not None]
+                if valid_sp:
+                    winners[ctx][ds][metric]["sp"] = max(valid_sp)
+
+    # --- Write LaTeX ---
     lines = []
+    # Column setup: Method | (AUROC AUPRC) * n_datasets
     col_spec = "l" + "cc" * len(datasets)
     lines.append(rf"\begin{{tabular}}{{{col_spec}}}")
     lines.append(r"\toprule")
@@ -767,38 +833,82 @@ def write_detection_table(df_det: pd.DataFrame, figures_dir: Path) -> None:
     lines.append(" & ".join(header_2) + r" \\")
     lines.append(r"\midrule")
 
-    for model in models:
-        lines.append(rf"\multicolumn{{{1 + 2*len(datasets)}}}{{l}}{{\textbf{{{latex_escape(model)}}}}} \\")
-        for method in METHOD_ORDER:
-            row = [latex_escape(method)]
-            for ds in datasets:
-                # Get Full subset rows
-                row_dat = df[(df["Model"] == model) & (df["Dataset"] == ds) & (df["Method"] == method)]
-                
-                if row_dat.empty:
-                    row.extend(["-", "-"])
-                else:
-                    val_auc = float(row_dat.iloc[0]["AUROC"])
-                    val_prc = float(row_dat.iloc[0]["AUPRC"])
-                    
-                    s_auc = f"{val_auc:.3f}"
-                    s_prc = f"{val_prc:.3f}"
+    # Helper for formatting cell
+    def format_cell(val, best_all, best_sp, is_single_pass):
+        if val is None: return "-"
+        s = f"{val:.3f}"
+        
+        is_best_overall = (val >= best_all - 1e-6)
+        is_best_sp = (is_single_pass and val >= best_sp - 1e-6)
+        
+        if is_best_overall and is_best_sp:
+            # Winner of both categories: Bold + Italic
+            return rf"\textit{{\textbf{{{s}}}}}"
+        elif is_best_overall:
+            # Overall winner only (e.g. Semantic Entropy)
+            return rf"\textbf{{{s}}}"
+        elif is_best_sp:
+            # Single-pass winner only
+            return rf"\textit{{{s}}}"
+        
+        return s
 
-                    # Bold logic
-                    if val_auc >= winners.get((model, ds, "AUROC"), -1) - 1e-6:
-                        s_auc = rf"\textbf{{{s_auc}}}"
-                    if val_prc >= winners.get((model, ds, "AUPRC"), -1) - 1e-6:
-                        s_prc = rf"\textbf{{{s_prc}}}"
-                    
-                    row.extend([s_auc, s_prc])
+    # BODY: Per Model
+    for model in models:
+        # Model Header Row with Base Accuracy
+        row_header = [rf"\textbf{{{latex_escape(model)}}}"]
+        for ds in datasets:
+            # Calculate Base Accuracy: 1 - Risk
+            risk = base_risks.get((model, ds), None)
+            if risk is not None:
+                acc = (1.0 - risk) * 100
+                acc_str = f"Acc: {acc:.1f}"
+            else:
+                acc_str = "Acc: -"
+            row_header.append(rf"\multicolumn{{2}}{{c}}{{\scriptsize{{{acc_str}}}}}")
+        
+        lines.append(" & ".join(row_header) + r" \\")
+
+        # Method Rows
+        for meth in methods:
+            row = [latex_escape(meth)]
+            is_sp = (meth in single_pass_methods)
+            
+            for ds in datasets:
+                dat = stats[model][meth][ds]
+                if dat:
+                    w = winners[model][ds]
+                    row.append(format_cell(dat["AUROC"], w["AUROC"]["all"], w["AUROC"]["sp"], is_sp))
+                    row.append(format_cell(dat["AUPRC"], w["AUPRC"]["all"], w["AUPRC"]["sp"], is_sp))
+                else:
+                    row.extend(["-", "-"])
             lines.append(" & ".join(row) + r" \\")
         lines.append(r"\addlinespace")
+
+    # BOTTOM: Overall Average
+    lines.append(r"\midrule")
+    lines.append(rf"\multicolumn{{{1 + 2*len(datasets)}}}{{l}}{{\textbf{{Overall Average (Across Models)}}}} \\")
+    
+    for meth in methods:
+        row = [latex_escape(meth)]
+        is_sp = (meth in single_pass_methods)
+        
+        for ds in datasets:
+            dat = stats["AVERAGE_ALL"][meth][ds]
+            if dat:
+                w = winners["AVERAGE_ALL"][ds]
+                row.append(format_cell(dat["AUROC"], w["AUROC"]["all"], w["AUROC"]["sp"], is_sp))
+                row.append(format_cell(dat["AUPRC"], w["AUPRC"]["all"], w["AUPRC"]["sp"], is_sp))
+            else:
+                row.extend(["-", "-"])
+        lines.append(" & ".join(row) + r" \\")
 
     lines.append(r"\bottomrule")
     lines.append(r"\end{tabular}")
 
     with open(figures_dir / "detection_metrics_table.tex", "w") as f:
         f.write("\n".join(lines))
+
 
 def write_aurc_table(df_aurc: pd.DataFrame, figures_dir: Path) -> None:
     df = df_aurc[df_aurc["Method"].isin(METHOD_ORDER)].copy()
@@ -1575,7 +1685,7 @@ def main():
     # Tables
     print("Generating LaTeX tables...")
     if not df_det.empty:
-        write_detection_table(df_det, figures_dir)
+        write_detection_table(df_det, base_risks, figures_dir)
     if not df_aurc.empty:
         write_aurc_table(df_aurc, figures_dir)
         write_naurcc_table(df_aurc, figures_dir)
