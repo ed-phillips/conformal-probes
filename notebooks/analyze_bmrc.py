@@ -1146,7 +1146,8 @@ def write_naurcc_table(df_aurc: pd.DataFrame, figures_dir: Path) -> None:
 
     with open(figures_dir / "naurcc_table.tex", "w") as f:
         f.write("\n".join(lines))
-
+        
+        
 def write_correlation_table(df_corr: pd.DataFrame, df_det: pd.DataFrame, figures_dir: Path) -> None:
     """
     Writes Table 1: Model | Correlation | AUROC (Acc Full) | AUROC (SE Full) | AUROC (Acc Conf) | AUROC (SE Conf)
@@ -1219,123 +1220,181 @@ def write_correlation_table(df_corr: pd.DataFrame, df_det: pd.DataFrame, figures
 
 def write_calibration_error_table(df_cal: pd.DataFrame, figures_dir: Path, included_datasets: Optional[List[str]] = None) -> None:
     """
-    Writes MACE / Max Excess Risk.
-    Filters calculation to alpha in [0.05, 0.25].
+    Writes TCE / EER table.
+    - Alpha Range: [0.05, 0.30].
+    - Formatting: 
+        - Bold: Best score across ALL methods.
+        - Italic: Best score across SINGLE-PASS methods (Acc Probe, SE Probe, Combined).
+    - Includes 'Overall Average' row at the bottom.
     """
-    # 1. Filter for valid coverage AND valid alpha range
-    # We only care about the operating window 0.05 <= alpha <= 0.25
+    # 1. Filter alpha range [0.05, 0.30]
     df = df_cal[
-        (df_cal["Coverage"] > 0.001) & 
         (df_cal["Target"] >= 0.049) & 
-        (df_cal["Target"] <= 0.251)
+        (df_cal["Target"] <= 0.301)
     ].copy()
     
     if df.empty: return
 
-    # Determine which datasets to process
     available_datasets = sorted(df["Dataset"].unique())
     if included_datasets is not None:
         datasets = [d for d in available_datasets if d in included_datasets]
-        if not datasets:
-            datasets = available_datasets
+        if not datasets: datasets = available_datasets
     else:
         datasets = available_datasets
 
     models = sorted(df["Model"].unique())
     
-    # Pre-calculate stats
+    # Define Single-Pass methods (Everything except the expensive sampling baseline)
+    single_pass_methods = [
+        "Accuracy Probe", 
+        "SE Probe", 
+        "Combined (LR)", 
+        "Combined (MLP)"
+    ]
+    
+    # Structure: stats[context][method] = {emp_tce, emp_eer, ...}
     stats = {}
     
+    # 2. Calculate Stats Per Model
     for m in models:
         stats[m] = {}
-        for d in datasets:
-            stats[m][d] = {}
-            for meth in METHOD_ORDER:
+        for meth in METHOD_ORDER:
+            mace_emp_vals = []
+            eer_emp_vals = []
+            mace_ucb_vals = []
+            eer_ucb_vals = []
+            
+            for d in datasets:
                 subset = df[(df["Model"] == m) & (df["Dataset"] == d) & (df["Method"] == meth)]
                 
-                res = {}
                 for mode in ["Empirical", "Conservative"]:
                     sub_mode = subset[subset["CalMode"] == mode]
-                    if sub_mode.empty:
-                        res[mode] = (np.nan, np.nan)
-                    else:
+                    if not sub_mode.empty:
                         diffs = sub_mode["Realized"] - sub_mode["Target"]
                         mace = np.mean(np.abs(diffs))
-                        max_excess = np.max(diffs)
-                        res[mode] = (mace, max_excess)
-                
-                stats[m][d][meth] = res
+                        eer = np.mean(np.maximum(0, diffs))
+                        
+                        if mode == "Empirical":
+                            mace_emp_vals.append(mace)
+                            eer_emp_vals.append(eer)
+                        else:
+                            mace_ucb_vals.append(mace)
+                            eer_ucb_vals.append(eer)
+            
+            if mace_emp_vals or mace_ucb_vals:
+                res = {}
+                res["emp_tce"] = np.mean(mace_emp_vals) if mace_emp_vals else np.nan
+                res["emp_eer"] = np.mean(eer_emp_vals) if eer_emp_vals else np.nan
+                res["ucb_tce"] = np.mean(mace_ucb_vals) if mace_ucb_vals else np.nan
+                res["ucb_eer"] = np.mean(eer_ucb_vals) if eer_ucb_vals else np.nan
+                stats[m][meth] = res
+            else:
+                stats[m][meth] = None
+
+    # 3. Calculate Overall Average (Across Models)
+    stats["AVERAGE_ALL"] = {}
+    for meth in METHOD_ORDER:
+        agg = {k: [] for k in ["emp_tce", "emp_eer", "ucb_tce", "ucb_eer"]}
+        for m in models:
+            s = stats[m].get(meth)
+            if s:
+                for k in agg:
+                    if not np.isnan(s[k]): agg[k].append(s[k])
+        
+        if any(agg.values()):
+            res = {}
+            for k in agg:
+                res[k] = np.mean(agg[k]) if agg[k] else np.nan
+            stats["AVERAGE_ALL"][meth] = res
+        else:
+            stats["AVERAGE_ALL"][meth] = None
 
     # --- Write LaTeX ---
     lines = []
     lines.append(r"\begin{tabular}{l|cc|cc}")
     lines.append(r"\toprule")
-    lines.append(r"& \multicolumn{2}{c|}{\textbf{Target Adherence (Empirical)}} & \multicolumn{2}{c}{\textbf{Strict Safety (UCB)}} \\")
-    lines.append(r"\textbf{Method} & \textbf{MACE} $\downarrow$ & \textbf{Max Excess} $\downarrow$ & \textbf{MACE} & \textbf{Max Excess} $\downarrow$ \\")
+    lines.append(r"& \multicolumn{2}{c|}{\textbf{Target Alignment}} & \multicolumn{2}{c}{\textbf{Target Safety}} \\")
+    lines.append(r"\textbf{Method} & \textbf{TCE} $\downarrow$ & \textbf{EER} $\downarrow$ & \textbf{TCE} $\downarrow$ & \textbf{EER} $\downarrow$ \\")
     lines.append(r"\midrule")
 
-    # Helper for formatting
-    def fmt_excess(val):
+    # Formatting Helper
+    def fmt_cell(val, best_all, best_sp, is_sp):
         if np.isnan(val): return "-"
-        s = f"{val:+.3f}"
-        if val > 0.005: return rf"\textcolor{{red}}{{{s}}}" 
-        if val < 0: return rf"\textcolor{{blue}}{{{s}}}"
+        s = f"{val:.3f}"
+        
+        is_best_overall = (best_all is not None and val <= best_all + 1e-9)
+        is_best_sp = (is_sp and best_sp is not None and val <= best_sp + 1e-9)
+        
+        if is_best_overall and is_best_sp:
+            return rf"\textit{{\textbf{{{s}}}}}"
+        elif is_best_overall:
+            return rf"\textbf{{{s}}}"
+        elif is_best_sp:
+            return rf"\textit{{{s}}}"
         return s
 
-    for m in models:
-        lines.append(rf"\multicolumn{{5}}{{l}}{{\textbf{{{latex_escape(m)}}}}} \\")
+    contexts = models + ["AVERAGE_ALL"]
+
+    for i, ctx in enumerate(contexts):
+        if ctx == "AVERAGE_ALL":
+            lines.append(r"\midrule")
+            lines.append(r"\multicolumn{5}{l}{\textbf{Overall Average (Across Models)}} \\")
+        else:
+            lines.append(rf"\multicolumn{{5}}{{l}}{{\textbf{{{latex_escape(ctx)}}}}} \\")
         
-        for meth in METHOD_ORDER:
-            mace_emp_vals = []
-            exc_emp_vals = []
-            mace_ucb_vals = []
-            exc_ucb_vals = []
+        # 1. Find Winners for this context
+        # We track min for "All" and min for "Single Pass" (sp)
+        best_vals = {
+            "emp_tce": {"all": 1e9, "sp": 1e9},
+            "emp_eer": {"all": 1e9, "sp": 1e9},
+            "ucb_tce": {"all": 1e9, "sp": 1e9},
+            "ucb_eer": {"all": 1e9, "sp": 1e9},
+        }
+        
+        has_data = False
+        
+        for meth, data in stats[ctx].items():
+            if data is None: continue
+            has_data = True
+            is_sp = (meth in single_pass_methods)
             
-            for d in datasets:
-                if meth in stats[m][d]:
-                    e_m, e_x = stats[m][d][meth]["Empirical"]
-                    u_m, u_x = stats[m][d][meth]["Conservative"]
-                    
-                    if not np.isnan(e_m):
-                        mace_emp_vals.append(e_m)
-                        exc_emp_vals.append(e_x)
-                    if not np.isnan(u_m):
-                        mace_ucb_vals.append(u_m)
-                        exc_ucb_vals.append(u_x)
+            for metric in best_vals:
+                if not np.isnan(data[metric]):
+                    # Update Global Min
+                    best_vals[metric]["all"] = min(best_vals[metric]["all"], data[metric])
+                    # Update Single-Pass Min
+                    if is_sp:
+                        best_vals[metric]["sp"] = min(best_vals[metric]["sp"], data[metric])
 
-            # Skip row only if BOTH modes are empty
-            if not mace_emp_vals and not mace_ucb_vals:
-                continue
+        # Reset sentinels
+        for metric in best_vals:
+            if best_vals[metric]["all"] == 1e9: best_vals[metric]["all"] = None
+            if best_vals[metric]["sp"] == 1e9: best_vals[metric]["sp"] = None
 
-            # Compute Empirical Stats
-            if mace_emp_vals:
-                avg_mace_emp = np.mean(mace_emp_vals)
-                max_exc_emp = np.max(exc_emp_vals)
-                str_mace_emp = f"{avg_mace_emp:.3f}"
-                str_exc_emp = fmt_excess(max_exc_emp)
-            else:
-                str_mace_emp = "-"
-                str_exc_emp = "-"
+        if not has_data:
+            lines.append(r"\addlinespace")
+            continue
 
-            # Compute UCB Stats (Handle empty case safely)
-            if mace_ucb_vals:
-                avg_mace_ucb = np.mean(mace_ucb_vals)
-                max_exc_ucb = np.max(exc_ucb_vals)
-                str_mace_ucb = f"{avg_mace_ucb:.3f}"
-                str_exc_ucb = fmt_excess(max_exc_ucb)
-            else:
-                str_mace_ucb = "-"
-                str_exc_ucb = "-"
-
-            row = [
-                latex_escape(meth),
-                str_mace_emp,
-                str_exc_emp,
-                str_mace_ucb,
-                str_exc_ucb
-            ]
+        # 2. Write Rows
+        for meth in METHOD_ORDER:
+            data = stats[ctx].get(meth, None)
+            if data is None: continue 
+            
+            is_sp = (meth in single_pass_methods)
+            
+            row = [latex_escape(meth)]
+            metrics = ["emp_tce", "emp_eer", "ucb_tce", "ucb_eer"]
+            
+            for m_key in metrics:
+                val = data[m_key]
+                best_all = best_vals[m_key]["all"]
+                best_sp = best_vals[m_key]["sp"]
+                row.append(fmt_cell(val, best_all, best_sp, is_sp))
+                
             lines.append(" & ".join(row) + r" \\")
-        lines.append(r"\addlinespace")
+        
+        if ctx != "AVERAGE_ALL":
+            lines.append(r"\addlinespace")
 
     lines.append(r"\bottomrule")
     lines.append(r"\end{tabular}")
