@@ -1033,8 +1033,9 @@ def write_naurcc_table(df_aurc: pd.DataFrame, figures_dir: Path) -> None:
     2. Row Average (Per Model, across Datasets)
     3. Bottom Block: Column Averages (Across Models) & Grand Mean
     
-    * No percentage conversion.
-    * 3 decimal places.
+    Formatting:
+    - Bold: Best Overall (Lowest nAURCC).
+    - Italic: Best Single-Pass (Lowest nAURCC among probes/combiners).
     """
     df = df_aurc[df_aurc["Method"].isin(METHOD_ORDER)].copy()
     if df.empty: return
@@ -1046,7 +1047,16 @@ def write_naurcc_table(df_aurc: pd.DataFrame, figures_dir: Path) -> None:
     models = sorted(df["Model"].unique())
     methods = [m for m in METHOD_ORDER if m in df["Method"].unique()]
 
-    # --- Pre-calculate Statistics & Winners ---
+    # Define Single-Pass methods (Everything except Semantic Entropy)
+    single_pass_methods = [
+        "Accuracy Probe", 
+        "SE Probe", 
+        "Combined (LR)", 
+        "Combined (MLP)"
+    ]
+
+    # --- Pre-calculate Statistics ---
+    # stats[context][method][dataset_key] = value
     stats = {}
     
     # 1. Individual entries + Row Means
@@ -1082,19 +1092,34 @@ def write_naurcc_table(df_aurc: pd.DataFrame, figures_dir: Path) -> None:
         # Grand Mean (Average of all nAURCC values for this method)
         stats["AVERAGE_ALL"][meth]["Avg"] = np.mean(all_models_vals) if all_models_vals else float("nan")
 
-    # 3. Identify Winners (Lowest nAURCC) for bolding
+    # 3. Identify Winners (Lowest nAURCC)
+    # winners[context_key][dataset_key] = {"all": min_val, "sp": min_val_sp}
     winners = {}
     all_model_keys = models + ["AVERAGE_ALL"]
     all_ds_keys = datasets + ["Avg"]
     
     for m_key in all_model_keys:
         for d_key in all_ds_keys:
-            best_val = 1e9
+            best_all = 1e9
+            best_sp = 1e9
+            
             for meth in methods:
                 val = stats[m_key][meth].get(d_key, float("nan"))
-                if not np.isnan(val) and val < best_val:
-                    best_val = val
-            winners[(m_key, d_key)] = best_val
+                if not np.isnan(val):
+                    # Check Overall
+                    if val < best_all:
+                        best_all = val
+                    
+                    # Check Single Pass
+                    if meth in single_pass_methods:
+                        if val < best_sp:
+                            best_sp = val
+            
+            # Handle empty cases
+            if best_all == 1e9: best_all = None
+            if best_sp == 1e9: best_sp = None
+            
+            winners[(m_key, d_key)] = {"all": best_all, "sp": best_sp}
 
     # --- Write LaTeX ---
     lines = []
@@ -1107,21 +1132,34 @@ def write_naurcc_table(df_aurc: pd.DataFrame, figures_dir: Path) -> None:
     lines.append(header)
     lines.append(r"\midrule")
 
+    # Helper for formatting
+    def fmt_cell(val, best_all, best_sp, is_sp):
+        if np.isnan(val): return "-"
+        s = f"{val:.3f}"
+        
+        is_best_overall = (best_all is not None and val <= best_all + 1e-9)
+        is_best_sp = (is_sp and best_sp is not None and val <= best_sp + 1e-9)
+        
+        if is_best_overall and is_best_sp:
+            return rf"\textit{{\textbf{{{s}}}}}"
+        elif is_best_overall:
+            return rf"\textbf{{{s}}}"
+        elif is_best_sp:
+            return rf"\textit{{{s}}}"
+        return s
+
     # Body: Per Model
     for model in models:
         lines.append(rf"\multicolumn{{{len(datasets) + 2}}}{{l}}{{\textbf{{{latex_escape(model)}}}}} \\")
         for meth in methods:
             row = [latex_escape(meth)]
+            is_sp = (meth in single_pass_methods)
+            
             for d_key in all_ds_keys:
                 val = stats[model][meth].get(d_key, float("nan"))
-                if np.isnan(val):
-                    row.append("-")
-                else:
-                    s = f"{val:.3f}"
-                    # Bold if within epsilon of winner
-                    if val <= winners[(model, d_key)] + 1e-6:
-                        s = rf"\textbf{{{s}}}"
-                    row.append(s)
+                w = winners[(model, d_key)]
+                row.append(fmt_cell(val, w["all"], w["sp"], is_sp))
+                
             lines.append(" & ".join(row) + r" \\")
         lines.append(r"\addlinespace")
 
@@ -1130,15 +1168,13 @@ def write_naurcc_table(df_aurc: pd.DataFrame, figures_dir: Path) -> None:
     lines.append(rf"\multicolumn{{{len(datasets) + 2}}}{{l}}{{\textbf{{Overall Average (Across Models)}}}} \\")
     for meth in methods:
         row = [latex_escape(meth)]
+        is_sp = (meth in single_pass_methods)
+        
         for d_key in all_ds_keys:
             val = stats["AVERAGE_ALL"][meth].get(d_key, float("nan"))
-            if np.isnan(val):
-                row.append("-")
-            else:
-                s = f"{val:.3f}"
-                if val <= winners[("AVERAGE_ALL", d_key)] + 1e-6:
-                    s = rf"\textbf{{{s}}}"
-                row.append(s)
+            w = winners[("AVERAGE_ALL", d_key)]
+            row.append(fmt_cell(val, w["all"], w["sp"], is_sp))
+            
         lines.append(" & ".join(row) + r" \\")
 
     lines.append(r"\bottomrule")
@@ -1147,7 +1183,7 @@ def write_naurcc_table(df_aurc: pd.DataFrame, figures_dir: Path) -> None:
     with open(figures_dir / "naurcc_table.tex", "w") as f:
         f.write("\n".join(lines))
         
-        
+
 def write_correlation_table(df_corr: pd.DataFrame, df_det: pd.DataFrame, figures_dir: Path) -> None:
     """
     Writes Table 1: Model | Correlation | AUROC (Acc Full) | AUROC (SE Full) | AUROC (Acc Conf) | AUROC (SE Conf)
