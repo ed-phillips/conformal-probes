@@ -49,12 +49,12 @@ from sklearn.metrics import roc_auc_score, average_precision_score
 
 DEFAULT_TARGET_MODELS = [
     "meta-llama/Llama-3.2-3B-Instruct",
-    "meta-llama/Llama-3.1-8B-Instruct",
+    # "meta-llama/Llama-3.1-8B-Instruct",
     "Qwen/Qwen3-4B-Instruct-2507",
-    "Qwen/Qwen3-8B",
+    # "Qwen/Qwen3-8B",
     "google/gemma-3-4b-it",
     "google/gemma-7b-it",
-    "HuggingFaceTB/SmolLM3-3B",
+    # "HuggingFaceTB/SmolLM3-3B",
     "mistralai/Ministral-8B-Instruct-2410",
 ]
 
@@ -136,26 +136,54 @@ def find_wandb_files_dir(run_dir: Path) -> Path:
 
 def load_run_artifacts(run_dir: Path) -> Optional[Dict[str, Any]]:
     """
-    Loads:
-      - validation_generations.pkl
-      - uncertainty_measures.pkl
-      - probes.pkl (required for 3-way+CV alignment)
+    Loads artifacts with verbose error reporting and fallback logic.
     """
-    files_dir = find_wandb_files_dir(run_dir)
+    # 1. Try to find the 'files' directory
+    files_dir = run_dir / "files"
+    
+    # Handle broken symlinks from SCP/Download:
+    if files_dir.is_symlink() and not files_dir.exists():
+        print(f"  [Warning] '{files_dir}' is a broken symlink. Searching for real files...")
+        files_dir = run_dir # Fallback to looking in the run root
 
+    if not files_dir.exists():
+        # Fallback: WandB sometimes nests in 'wandb/latest-run/files'
+        candidates = list(run_dir.rglob("uncertainty_measures.pkl"))
+        if candidates:
+            files_dir = candidates[0].parent
+            print(f"  [Info] Found artifacts in nested path: {files_dir}")
+        else:
+            print(f"  [Skip] No 'files' directory or artifacts found in {run_dir.name}")
+            return None
+
+    # 2. Define expected paths
     p_gens = files_dir / "validation_generations.pkl"
     p_unc = files_dir / "uncertainty_measures.pkl"
     p_probes = files_dir / "probes.pkl"
 
-    if not (p_gens.exists() and p_unc.exists() and p_probes.exists()):
+    # 3. Check existence and print SPECIFIC missing file
+    missing = []
+    if not p_gens.exists(): missing.append("validation_generations.pkl")
+    if not p_unc.exists(): missing.append("uncertainty_measures.pkl")
+    if not p_probes.exists(): missing.append("probes.pkl")
+
+    if missing:
+        print(f"  [Skip] {run_dir.name} is missing files: {', '.join(missing)}")
+        if "probes.pkl" in missing:
+            print(f"         (Hint: Did you download 'probes.pkl'? Or run with --retrain-probes?)")
         return None
 
-    with p_gens.open("rb") as f:
-        gens = pickle.load(f)
-    with p_unc.open("rb") as f:
-        unc = pickle.load(f)
-    with p_probes.open("rb") as f:
-        probes = pickle.load(f)
+    # 4. Load
+    try:
+        with p_gens.open("rb") as f:
+            gens = pickle.load(f)
+        with p_unc.open("rb") as f:
+            unc = pickle.load(f)
+        with p_probes.open("rb") as f:
+            probes = pickle.load(f)
+    except Exception as e:
+        print(f"  [Error] Failed to pickle load in {run_dir.name}: {e}")
+        return None
 
     return {
         "files_dir": files_dir,
@@ -163,7 +191,6 @@ def load_run_artifacts(run_dir: Path) -> Optional[Dict[str, Any]]:
         "unc": unc,
         "probes": probes,
     }
-
 
 # -----------------------------
 # Data Extraction
@@ -1445,7 +1472,7 @@ def write_calibration_error_table(df_cal: pd.DataFrame, figures_dir: Path, inclu
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--runs-root", type=str, required=True)
-    parser.add_argument("--figures-dirname", type=str, default="analysis_output_v5")
+    parser.add_argument("--figures-dirname", type=str, default="analysis_output_local")
     # parser.add_argument("--embedding-key", type=str, default="emb_last_tok_before_gen")
     parser.add_argument("--n-cap", type=int, default=2000)
     parser.add_argument("--hall-acc-threshold", type=float, default=0.99)
@@ -1453,8 +1480,8 @@ def main():
     parser.add_argument("--use-ucb", action="store_true")
     parser.add_argument("--delta", type=float, default=0.1)
 
-    parser.add_argument("--decision-plot-method", type=str, default="MLP", choices=["LR", "MLP", "GBM"])
-    parser.add_argument("--decision-plot-alpha", type=float, default=0.10)
+    parser.add_argument("--decision-plot-method", type=str, default="MLP", choices=["LR", "MLP"])
+    parser.add_argument("--decision-plot-alpha", type=float, default=0.20)
     parser.add_argument(
     "--retrain-probes",
     action="store_true",
@@ -1520,7 +1547,11 @@ def main():
         for dataset_name in DEFAULT_TARGET_DATASETS:
             run_dir = find_run_directory(runs_root, model_name, dataset_name)
             if not run_dir:
+                target_folder = f"{safe_model}__{dataset_name}"
+                print(f"[Miss] Could not find folder '{target_folder}' in {runs_root}")
                 continue
+
+            print(f"[Found] Processing {run_dir.name}...")
 
             artifacts = load_run_artifacts(run_dir)
             if artifacts is None:
