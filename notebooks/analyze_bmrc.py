@@ -21,12 +21,14 @@ Usage:
   python analyze_results.py --runs-root /path/to/runs --figures-dirname analysis_output_v4
 """
 
+from email import parser
 import os
 import argparse
 import pickle
 from pathlib import Path
 from typing import Dict, Tuple, Optional, List, Any
 import subprocess
+import shutil
 
 import numpy as np
 import pandas as pd
@@ -64,13 +66,109 @@ DEFAULT_TARGET_DATASETS = [
     "medical_o1",
 ]
 
-# Plotting aesthetics
-sns.set_theme(style="whitegrid", context="paper", font_scale=1.4)
-plt.rcParams["font.family"] = "serif"
+
+# -----------------------------
+# Display names + global style
+# -----------------------------
+
+# Keys here should match `safe_model = Path(model_name).name`
+PRETTY_MODEL_NAMES = {
+    "Llama-3.2-3B-Instruct": "Llama 3.2 3B",
+    "Qwen3-4B-Instruct-2507": "Qwen3 4B",
+    "gemma-3-4b-it": "Gemma 3 4B",
+    "gemma-7b-it": "Gemma 7B",
+    "Ministral-8B-Instruct-2410": "Ministral 8B",
+}
+
+PRETTY_DATASET_NAMES = {
+    "trivia_qa": "TriviaQA",
+    "bioasq": "BioASQ",
+    "medical_o1": "MedicalQA",
+}
+
+METHOD_DISPLAY_NAMES = {
+    "Accuracy Probe": "PC Probe",
+}
+
+def pretty_method(m: str) -> str:
+    return METHOD_DISPLAY_NAMES.get(m, m)
+
+def pretty_model(model_key: str) -> str:
+    return PRETTY_MODEL_NAMES.get(model_key, model_key)
+
+def pretty_dataset(ds_key: str) -> str:
+    return PRETTY_DATASET_NAMES.get(ds_key, ds_key)
+
+def configure_plotting(font_scale: float, base_fontsize: Optional[int], context: str) -> None:
+    """
+    Centralized plotting config. Use CLI flags to increase fonts e.g. for posters.
+    """
+    sns.set_theme(style="whitegrid", context=context, font_scale=font_scale)
+    plt.rcParams["font.family"] = "serif"
+    # Nice-to-have for publication (editable text in PDFs if you save pdfs later)
+    plt.rcParams["pdf.fonttype"] = 42
+    plt.rcParams["ps.fonttype"] = 42
+
+    if base_fontsize is not None:
+        plt.rcParams.update({
+            "font.size": base_fontsize,
+            "axes.titlesize": base_fontsize * 1.0,
+            "axes.labelsize": base_fontsize * 1.0,
+            "xtick.labelsize": base_fontsize * 1.0,
+            "ytick.labelsize": base_fontsize * 1.0,
+            "legend.fontsize": base_fontsize * 1.0,
+            "figure.titlesize": base_fontsize * 1.0,
+        })
+
+def apply_tex_font_profile(profile: str) -> None:
+    """
+    Switch figure typography to match LaTeX doc fonts.
+    Requires a working LaTeX install if text.usetex=True.
+    Profiles:
+      - "paper_times": Times-like (newtxtext/newtxmath)
+      - "poster_lmodern": Latin Modern (lmodern / Computer Modern family)
+      - "none": don't use LaTeX rendering
+    """
+    if profile == "none":
+        plt.rcParams.update({
+            "text.usetex": False,
+            "mathtext.fontset": "stix",
+            "font.family": "serif",
+            "font.serif": ["STIX Two Text", "STIXGeneral", "DejaVu Serif"],
+            "axes.unicode_minus": False,
+        })
+        return
+
+    # default: enable latex rendering (paper), can be overridden per profile
+    plt.rcParams.update({
+        "axes.unicode_minus": False,
+        "pdf.fonttype": 42,
+        "ps.fonttype": 42,
+    })
+    if profile == "paper_times":
+        # Match `\usepackage{iclr2026_conference,times}`
+        # (iclr style sets layout; here we only mirror font selection)
+        plt.rcParams["text.latex.preamble"] = (
+            r"\usepackage[T1]{fontenc}"
+            r"\usepackage{times}"
+        )
+    elif profile == "poster_gemini":
+        # Match Gemini theme: Lato for body/sans; use plain mathtext.
+        # This avoids needing xelatex/fontspec inside matplotlib.
+        plt.rcParams.update({
+            "text.usetex": False,
+            "font.family": "sans-serif",
+            "font.sans-serif": ["Lato", "Raleway", "DejaVu Sans"],
+            "mathtext.fontset": "dejavusans",
+        })
+    else:
+        raise ValueError(f"Unknown tex font profile: {profile}")
+
 
 COLORS = {
     "Semantic Entropy": "#7f8c8d",
     "Accuracy Probe": "#3498db",
+    "PC Probe": "#3498db",
     "SE Probe": "#e67e22",
     "Combined (LR)": "#2ecc71",
     "Combined (MLP)": "#9b59b6",
@@ -191,6 +289,20 @@ def load_run_artifacts(run_dir: Path) -> Optional[Dict[str, Any]]:
         "unc": unc,
         "probes": probes,
     }
+
+def save_figure(path_no_ext: Path, dpi: int = 300) -> None:
+    """
+    Save figures robustly.
+    - Always saves PDF (best for papers/posters, no dvipng required).
+    - Saves PNG only if dvipng is available or usetex is off.
+    """
+    # Vector: best for publications
+    plt.savefig(path_no_ext.with_suffix(".pdf"), bbox_inches="tight")
+
+    use_tex = bool(plt.rcParams.get("text.usetex", False))
+    has_dvipng = shutil.which("dvipng") is not None
+    if (not use_tex) or has_dvipng:
+        plt.savefig(path_no_ext.with_suffix(".png"), dpi=dpi, bbox_inches="tight")
 
 # -----------------------------
 # Data Extraction
@@ -471,35 +583,52 @@ def compute_normalized_aurcc(cov: List[float], risk: List[float], base_risk: flo
 # Plotting
 # -----------------------------
 
-def plot_detection_bars(df_det: pd.DataFrame, figures_dir: Path) -> None:
-    for model in df_det["Model"].unique():
+def plot_detection_bars(df_det: pd.DataFrame, figures_dir: Path, model_order: List[str], dataset_order: List[str], dpi: int) -> None:
+    # enforce categorical ordering on pretty labels
+    ds_pretty_order = [pretty_dataset(d) for d in dataset_order]
+    for model_key in model_order:
         for subset in ["Full", "Confident"]:
-            data = df_det[(df_det["Model"] == model) & (df_det["Subset"] == subset)]
+            data = df_det[(df_det["ModelKey"] == model_key) & (df_det["Subset"] == subset)].copy()
             if data.empty:
                 continue
-
+            data["Dataset"] = pd.Categorical(data["Dataset"], categories=ds_pretty_order, ordered=True)
             plt.figure(figsize=(9, 6))
+            data = data.copy()
+            data["MethodDisplay"] = data["Method"].map(pretty_method)
             sns.barplot(
                 data=data,
                 x="Dataset",
                 y="AUROC",
-                hue="Method",
+                hue="MethodDisplay",
                 palette=COLORS,
                 edgecolor="black",
                 errorbar=None,
-                hue_order=[m for m in METHOD_ORDER if m in data["Method"].unique()],
+                hue_order=[pretty_method(m) for m in METHOD_ORDER if m in data["Method"].unique()]
             )
-            plt.title(f"{model} - {subset} Subset")
+            plt.title(f"{pretty_model(model_key)} - {subset} Subset")
             plt.ylim(0.4, 1.0)
-            plt.legend(bbox_to_anchor=(1.05, 1), loc="upper left")
+            # Legend inside plot area
+            leg = plt.legend(
+                loc="upper right",
+                bbox_to_anchor=(0.98, 0.98),   # inside axes coords
+                borderaxespad=0.0,
+                frameon=True,
+                framealpha=0.95,
+                title=None,
+            )
+            # Make legend box a bit more compact
+            for lh in leg.legend_handles:
+                try:
+                    lh.set_alpha(1.0)
+                except Exception:
+                    pass
             plt.tight_layout()
 
-            safe_model = model.replace("/", "_")
-            plt.savefig(figures_dir / f"detection_{safe_model}_{subset}.png", dpi=300)
+            save_figure((figures_dir / f"detection_{model_key}_{subset}").with_suffix(""), dpi=dpi)
             plt.close()
 
 
-def plot_layer_sensitivity(layer_results: List[dict], figures_dir: Path) -> None:
+def plot_layer_sensitivity(layer_results: List[dict], figures_dir: Path, dpi: int) -> None:
     for item in layer_results:
         acc_aucs = item.get("acc_cv_aucs", [])
         se_aucs = item.get("se_cv_aucs", [])
@@ -521,12 +650,13 @@ def plot_layer_sensitivity(layer_results: List[dict], figures_dir: Path) -> None
         plt.legend()
         plt.grid(True, alpha=0.3)
         plt.tight_layout()
-        safe_model = item["Model"].replace("/", "_")
-        plt.savefig(figures_dir / f"layers_{safe_model}_{item['Dataset']}.png", dpi=300)
+        safe_model = item["ModelKey"]
+        ds_key = item["DatasetKey"]
+        save_figure((figures_dir / f"layers_{safe_model}_{ds_key}").with_suffix(""), dpi=dpi)
         plt.close()
 
 
-def plot_risk_coverage(curve_data: dict, figures_dir: Path, base_risks: dict) -> None:
+def plot_risk_coverage(curve_data: dict, figures_dir: Path, base_risks: dict, dpi: int) -> None:
     """
     Includes an "Ideal (Oracle)" line based on base risk on the test set.
     """
@@ -543,14 +673,32 @@ def plot_risk_coverage(curve_data: dict, figures_dir: Path, base_risks: dict) ->
 
             max_r = base_risk
             for m_name, (cov, risk) in methods.items():
-                plt.plot(cov, risk, label=m_name, color=COLORS.get(m_name, "black"), linewidth=2.5)
+                plt.plot(
+                    cov, risk,
+                    label=pretty_method(m_name),
+                    color=COLORS.get(pretty_method(m_name), COLORS.get(m_name, "black")),
+                    linewidth=2.5,
+                )
                 if len(risk) > 0:
                     max_r = max(max_r, max(risk))
 
             plt.xlabel("Coverage")
-            plt.ylabel("Hallucination Rate (Risk)")
-            plt.title(f"Risk-Coverage: {model} / {ds}")
-            plt.legend()
+            plt.ylabel("Hallucination Rate")
+            plt.title(f"Risk-Coverage: {pretty_model(model)} / {pretty_dataset(ds)}")
+            leg = plt.legend(
+                loc="upper left",
+                bbox_to_anchor=(0.02, 0.98),   # inside axes coords
+                borderaxespad=0.0,
+                frameon=True,
+                framealpha=0.95,
+                title=None,
+            )
+            # Make legend box a bit more compact
+            for lh in leg.legend_handles:
+                try:
+                    lh.set_alpha(1.0)
+                except Exception:
+                    pass
             plt.xlim(0, 1)
 
             top_lim = min(1.0, max_r * 1.15) if max_r > 0 else 1.0
@@ -558,22 +706,26 @@ def plot_risk_coverage(curve_data: dict, figures_dir: Path, base_risks: dict) ->
             plt.grid(True, alpha=0.3)
 
             safe_model = model.replace("/", "_")
-            plt.savefig(figures_dir / f"rc_{safe_model}_{ds}.png", dpi=300)
+            save_figure(
+                (figures_dir / f"rc_{safe_model}_{ds}").with_suffix(""),
+                dpi=dpi,
+            )
             plt.close()
 
 
-def plot_calibration_curves(df_cal: pd.DataFrame, figures_dir: Path) -> None:
+def plot_calibration_curves(df_cal: pd.DataFrame, figures_dir: Path, model_order: List[str], dataset_order: List[str], dpi: int) -> None:
     """
     Plots Target risk (x) vs Realized risk (y).
     One Figure per (Model, Dataset).
     Subplots: [Empirical (Target Adherence)] [Conservative (Safety/UCB)]
     """
-    unique_models = df_cal["Model"].unique()
-    unique_datasets = sorted(df_cal["Dataset"].unique())
+     # iterate in requested order, using keys
+    unique_models = model_order
+    unique_datasets = dataset_order
 
     for model in unique_models:
         for ds in unique_datasets:
-            data = df_cal[(df_cal["Model"] == model) & (df_cal["Dataset"] == ds)]
+            data = df_cal[(df_cal["ModelKey"] == model) & (df_cal["DatasetKey"] == ds)]
             if data.empty:
                 continue
 
@@ -582,11 +734,13 @@ def plot_calibration_curves(df_cal: pd.DataFrame, figures_dir: Path) -> None:
             # Subplot 1: Empirical
             ax_emp = axes[0]
             data_emp = data[data["CalMode"] == "Empirical"]
+            data_emp = data_emp.copy()
+            data_emp["MethodDisplay"] = data_emp["Method"].map(pretty_method)
             
             ax_emp.plot([0, 1], [0, 1], "k--", alpha=0.4, linewidth=1)
             if not data_emp.empty:
                 sns.lineplot(
-                    data=data_emp, x="Target", y="Realized", hue="Method",
+                    data=data_emp, x="Target", y="Realized", hue="MethodDisplay",
                     palette=COLORS, linewidth=2.5, ax=ax_emp, estimator=None
                 )
             ax_emp.set_title("Target Adherence (Empirical)")
@@ -600,11 +754,13 @@ def plot_calibration_curves(df_cal: pd.DataFrame, figures_dir: Path) -> None:
             # Subplot 2: Conservative (UCB)
             ax_ucb = axes[1]
             data_ucb = data[data["CalMode"] == "Conservative"]
+            data_ucb = data_ucb.copy()
+            data_ucb["MethodDisplay"] = data_ucb["Method"].map(pretty_method)
             
             ax_ucb.plot([0, 1], [0, 1], "k--", alpha=0.4, linewidth=1)
             if not data_ucb.empty:
                 sns.lineplot(
-                    data=data_ucb, x="Target", y="Realized", hue="Method",
+                    data=data_ucb, x="Target", y="Realized", hue="MethodDisplay",
                     palette=COLORS, linewidth=2.5, ax=ax_ucb, estimator=None
                 )
             ax_ucb.set_title(r"Strict Safety (UCB, $\delta=0.1$)")
@@ -619,12 +775,11 @@ def plot_calibration_curves(df_cal: pd.DataFrame, figures_dir: Path) -> None:
             
             fig.legend(handles, labels, loc="lower center", bbox_to_anchor=(0.5, -0.05), ncol=len(labels), frameon=False)
             
-            fig.suptitle(f"Calibration: {model} / {ds}", y=0.98, fontsize=14)
+            fig.suptitle(f"Calibration: {pretty_model(model)} / {pretty_dataset(ds)}", y=0.98, fontsize=14)
             plt.tight_layout()
             plt.subplots_adjust(bottom=0.2) # Make room for legend
 
-            safe_model = model.replace("/", "_")
-            plt.savefig(figures_dir / f"calibration_{safe_model}_{ds}.png", dpi=300, bbox_inches="tight")
+            save_figure((figures_dir / f"calibration_{model}_{ds}").with_suffix(""), dpi=dpi)
             plt.close()
 
 
@@ -637,6 +792,7 @@ def plot_decision_boundary(
     use_ucb: bool,
     out_path: Path,
     title: str,
+    dpi: int,
 ) -> None:
     """
     Uses the SAME fitted combiner_model that produced score_col.
@@ -679,10 +835,10 @@ def plot_decision_boundary(
     plt.ylim(0, 1)
     plt.legend(loc="upper right")
     plt.tight_layout()
-    plt.savefig(out_path, dpi=300)
+    save_figure(out_path.with_suffix(""), dpi=dpi)
     plt.close()
 
-def plot_correlation_scatter(df: pd.DataFrame, model_name: str, ds_name: str, out_path: Path):
+def plot_correlation_scatter(df: pd.DataFrame, model_name: str, ds_name: str, out_path: Path, dpi: int) -> None:
     """
     Plots Semantic Entropy vs Accuracy Probe Logits.
     Clean, consistent style with other figures.
@@ -706,14 +862,15 @@ def plot_correlation_scatter(df: pd.DataFrame, model_name: str, ds_name: str, ou
     # 3. Scatter Plot
     sns.scatterplot(
         data=plot_df,
-        x="se_jittered",
+        x="se_raw",
         y="logit_correct",
         hue="Label",
         style="Label",
         markers={"Correct": "o", "Hallucination": "o"}, # Keep shape simple
         palette=custom_palette,
         alpha=0.5,       # Transparency is key for density
-        s=30,            # Marker size
+        sizes=(100, 100),
+        size="Label",
         edgecolor="w",   # Slight white edge helps separation
         linewidth=0.3
     )
@@ -727,8 +884,8 @@ def plot_correlation_scatter(df: pd.DataFrame, model_name: str, ds_name: str, ou
     # plt.axhline(y=0, color='gray', linestyle=':', alpha=0.6, linewidth=1.5)
 
     # 5. Labels & Formatting
-    plt.xlabel("Semantic Entropy (Uncertainty)")
-    plt.ylabel(r"Accuracy Probe Logits ($\leftarrow$ Hallucination | Correct $\rightarrow$)")
+    plt.xlabel("Semantic Entropy")
+    plt.ylabel("Correctness Logit")
     plt.title(f"{model_name} / {ds_name}")
 
     # Move legend to best spot, usually upper right for this distribution
@@ -742,7 +899,7 @@ def plot_correlation_scatter(df: pd.DataFrame, model_name: str, ds_name: str, ou
     plt.ylim(y_min - 0.5, y_max + 0.5)
 
     plt.tight_layout()
-    plt.savefig(out_path, dpi=300)
+    save_figure(out_path.with_suffix(""), dpi=dpi)
     plt.close()
 
 # -----------------------------
@@ -753,7 +910,14 @@ def latex_escape(s: str) -> str:
     return str(s).replace("_", r"\_").replace("%", r"\%")
 
 
-def write_detection_table(df_det: pd.DataFrame, base_risks: Dict[Tuple[str, str], float], figures_dir: Path) -> None:
+def write_detection_table(
+    df_det: pd.DataFrame,
+    base_risks: Dict[Tuple[str, str], float],
+    figures_dir: Path,
+    model_order: List[str],
+    dataset_order: List[str],
+) -> None:
+
     """
     Writes detection metrics table (AUROC / AUPRC).
     - Rows: Methods grouped by Model.
@@ -769,8 +933,9 @@ def write_detection_table(df_det: pd.DataFrame, base_risks: Dict[Tuple[str, str]
     # Filter to Full subset only
     df = df[df["Subset"] == "Full"]
 
-    datasets = sorted(df["Dataset"].unique())
-    models = sorted(df["Model"].unique())
+    # Use user-requested order (keys), but render pretty names in headers
+    datasets = [d for d in dataset_order if d in df["DatasetKey"].unique()]
+    models = [m for m in model_order if m in df["ModelKey"].unique()]
     methods = [m for m in METHOD_ORDER if m in df["Method"].unique()]
     
     # Define Single-Pass methods for italics logic
@@ -787,7 +952,7 @@ def write_detection_table(df_det: pd.DataFrame, base_risks: Dict[Tuple[str, str]
         for meth in methods:
             stats[m][meth] = {}
             for ds in datasets:
-                row = df[(df["Model"] == m) & (df["Dataset"] == ds) & (df["Method"] == meth)]
+                row = df[(df["ModelKey"] == m) & (df["DatasetKey"] == ds) & (df["Method"] == meth)]
                 if not row.empty:
                     stats[m][meth][ds] = {
                         "AUROC": float(row.iloc[0]["AUROC"]),
@@ -850,7 +1015,7 @@ def write_detection_table(df_det: pd.DataFrame, base_risks: Dict[Tuple[str, str]
     # Header 1: Datasets
     header_1 = [r"\textbf{Method}"]
     for ds in datasets:
-        header_1.append(rf"\multicolumn{{2}}{{c}}{{\textbf{{{latex_escape(ds)}}}}}")
+        header_1.append(rf"\multicolumn{{2}}{{c}}{{\textbf{{{latex_escape(pretty_dataset(ds))}}}}}")
     lines.append(" & ".join(header_1) + r" \\")
 
     # Header 2: Metrics
@@ -883,7 +1048,7 @@ def write_detection_table(df_det: pd.DataFrame, base_risks: Dict[Tuple[str, str]
     # BODY: Per Model
     for model in models:
         # Model Header Row with Base Accuracy
-        row_header = [rf"\textbf{{{latex_escape(model)}}}"]
+        row_header = [rf"\textbf{{{latex_escape(pretty_model(model))}}}"]
         for ds in datasets:
             # Calculate Base Accuracy: 1 - Risk
             risk = base_risks.get((model, ds), None)
@@ -898,7 +1063,7 @@ def write_detection_table(df_det: pd.DataFrame, base_risks: Dict[Tuple[str, str]
 
         # Method Rows
         for meth in methods:
-            row = [latex_escape(meth)]
+            row = [latex_escape(pretty_method(meth))]
             is_sp = (meth in single_pass_methods)
             
             for ds in datasets:
@@ -917,7 +1082,7 @@ def write_detection_table(df_det: pd.DataFrame, base_risks: Dict[Tuple[str, str]
     lines.append(rf"\multicolumn{{{1 + 2*len(datasets)}}}{{l}}{{\textbf{{Overall Average (Across Models)}}}} \\")
     
     for meth in methods:
-        row = [latex_escape(meth)]
+        row = [latex_escape(pretty_method(meth))]
         is_sp = (meth in single_pass_methods)
         
         for ds in datasets:
@@ -937,18 +1102,22 @@ def write_detection_table(df_det: pd.DataFrame, base_risks: Dict[Tuple[str, str]
         f.write("\n".join(lines))
 
 
-def write_aurc_table(df_aurc: pd.DataFrame, figures_dir: Path) -> None:
+def write_aurc_table(
+    df_aurc: pd.DataFrame,
+    figures_dir: Path,
+    model_order: List[str],
+    dataset_order: List[str],
+) -> None:
     df = df_aurc[df_aurc["Method"].isin(METHOD_ORDER)].copy()
     if df.empty:
         return
 
-    datasets = sorted(df["Dataset"].unique())
-    models = sorted(df["Model"].unique())
-
+    datasets = [d for d in dataset_order if d in df["DatasetKey"].unique()]
+    models = [m for m in model_order if m in df["ModelKey"].unique()]
     winners = {}
     for model in models:
         for ds in datasets:
-            sd = df[(df["Model"] == model) & (df["Dataset"] == ds)]
+            sd = df[(df["ModelKey"] == model) & (df["DatasetKey"] == ds)]
             winners[(model, ds)] = sd["AURC"].min() if not sd.empty else 1e9
 
     lines = []
@@ -956,16 +1125,16 @@ def write_aurc_table(df_aurc: pd.DataFrame, figures_dir: Path) -> None:
     lines.append(rf"\begin{{tabular}}{{{col_spec}}}")
     lines.append(r"\toprule")
 
-    header = [r"\textbf{Method}"] + [rf"\textbf{{{latex_escape(ds)}}}" for ds in datasets]
+    header = [r"\textbf{Method}"] + [rf"\textbf{{{latex_escape(pretty_dataset(ds))}}}" for ds in datasets]
     lines.append(" & ".join(header) + r" \\")
     lines.append(r"\midrule")
 
     for model in models:
-        lines.append(rf"\multicolumn{{{1 + len(datasets)}}}{{l}}{{\textbf{{{latex_escape(model)}}}}} \\")
+        lines.append(rf"\multicolumn{{{1 + len(datasets)}}}{{l}}{{\textbf{{{latex_escape(pretty_model(model))}}}}} \\")
         for method in METHOD_ORDER:
             row = [latex_escape(method)]
             for ds in datasets:
-                v = df[(df["Model"] == model) & (df["Dataset"] == ds) & (df["Method"] == method)]["AURC"]
+                v = df[(df["ModelKey"] == model) & (df["DatasetKey"] == ds) & (df["Method"] == method)]["AURC"]
                 if v.empty:
                     row.append("-")
                 else:
@@ -1053,7 +1222,13 @@ def write_calibration_tables(df_cal: pd.DataFrame, figures_dir: Path, table_alph
             f.write("\n".join(lines))
 
 
-def write_naurcc_table(df_aurc: pd.DataFrame, figures_dir: Path) -> None:
+def write_naurcc_table(
+    df_aurc: pd.DataFrame,
+    figures_dir: Path,
+    model_order: List[str],
+    dataset_order: List[str],
+) -> None:
+
     """
     Writes nAURCC table with:
     1. Values per (Model, Dataset)
@@ -1070,8 +1245,8 @@ def write_naurcc_table(df_aurc: pd.DataFrame, figures_dir: Path) -> None:
     # Use raw nAURCC values (0 to 1 scale)
     value_col = "nAURCC"
 
-    datasets = sorted(df["Dataset"].unique())
-    models = sorted(df["Model"].unique())
+    datasets = [d for d in dataset_order if d in df["DatasetKey"].unique()]
+    models = [m for m in model_order if m in df["ModelKey"].unique()]
     methods = [m for m in METHOD_ORDER if m in df["Method"].unique()]
 
     # Define Single-Pass methods (Everything except Semantic Entropy)
@@ -1093,7 +1268,7 @@ def write_naurcc_table(df_aurc: pd.DataFrame, figures_dir: Path) -> None:
             stats[m][meth] = {}
             row_vals = []
             for d in datasets:
-                val = df[(df["Model"] == m) & (df["Dataset"] == d) & (df["Method"] == meth)][value_col]
+                val = df[(df["ModelKey"] == m) & (df["DatasetKey"] == d) & (df["Method"] == meth)][value_col]
                 if not val.empty:
                     v = float(val.iloc[0])
                     stats[m][meth][d] = v
@@ -1111,7 +1286,7 @@ def write_naurcc_table(df_aurc: pd.DataFrame, figures_dir: Path) -> None:
         
         all_models_vals = []
         for d in datasets:
-            vals = df[(df["Dataset"] == d) & (df["Method"] == meth)][value_col]
+            vals = df[(df["DatasetKey"] == d) & (df["Method"] == meth)][value_col]
             mean_val = vals.mean() if not vals.empty else float("nan")
             stats["AVERAGE_ALL"][meth][d] = mean_val
             if not vals.empty: all_models_vals.extend(vals.values)
@@ -1155,7 +1330,7 @@ def write_naurcc_table(df_aurc: pd.DataFrame, figures_dir: Path) -> None:
     lines.append(r"\toprule")
     
     # Header
-    header = r"\textbf{Method} & " + " & ".join([rf"\textbf{{{latex_escape(ds)}}}" for ds in datasets]) + r" & \textbf{Mean} \\"
+    header = r"\textbf{Method} & " + " & ".join([rf"\textbf{{{latex_escape(pretty_dataset(ds))}}}" for ds in datasets]) + r" & \textbf{Mean} \\"
     lines.append(header)
     lines.append(r"\midrule")
 
@@ -1177,9 +1352,9 @@ def write_naurcc_table(df_aurc: pd.DataFrame, figures_dir: Path) -> None:
 
     # Body: Per Model
     for model in models:
-        lines.append(rf"\multicolumn{{{len(datasets) + 2}}}{{l}}{{\textbf{{{latex_escape(model)}}}}} \\")
+        lines.append(rf"\multicolumn{{{len(datasets) + 2}}}{{l}}{{\textbf{{{latex_escape(pretty_model(model))}}}}} \\")
         for meth in methods:
-            row = [latex_escape(meth)]
+            row = [latex_escape(pretty_method(meth))]
             is_sp = (meth in single_pass_methods)
             
             for d_key in all_ds_keys:
@@ -1194,7 +1369,7 @@ def write_naurcc_table(df_aurc: pd.DataFrame, figures_dir: Path) -> None:
     lines.append(r"\midrule")
     lines.append(rf"\multicolumn{{{len(datasets) + 2}}}{{l}}{{\textbf{{Overall Average (Across Models)}}}} \\")
     for meth in methods:
-        row = [latex_escape(meth)]
+        row = [latex_escape(pretty_method(meth))]
         is_sp = (meth in single_pass_methods)
         
         for d_key in all_ds_keys:
@@ -1211,7 +1386,13 @@ def write_naurcc_table(df_aurc: pd.DataFrame, figures_dir: Path) -> None:
         f.write("\n".join(lines))
         
 
-def write_correlation_table(df_corr: pd.DataFrame, df_det: pd.DataFrame, figures_dir: Path) -> None:
+def write_correlation_table(
+    df_corr: pd.DataFrame,
+    df_det: pd.DataFrame,
+    figures_dir: Path,
+    model_order: List[str],
+    dataset_order: List[str],
+) -> None:
     """
     Writes Table 1: Model | Correlation | AUROC (Acc Full) | AUROC (SE Full) | AUROC (Acc Conf) | AUROC (SE Conf)
     """
@@ -1224,7 +1405,7 @@ def write_correlation_table(df_corr: pd.DataFrame, df_det: pd.DataFrame, figures
     # Alternatively, if you want every pair, change logic below. 
     # Let's do One row per Model (Averaged across datasets) to keep it compact like the draft Table 1.
     
-    models = sorted(df_corr["Model"].unique())
+    models = [m for m in model_order if m in df_corr["ModelKey"].unique()]
     
     lines = []
     lines.append(r"\begin{tabular}{lccccc}")
@@ -1234,12 +1415,17 @@ def write_correlation_table(df_corr: pd.DataFrame, df_det: pd.DataFrame, figures
     lines.append(r"\midrule")
 
     for model in models:
-        # 1. Get average correlation
-        mean_corr = df_corr[df_corr["Model"] == model]["Correlation"].mean()
+        # 1. Get average correlation across datasets (optionally restrict to dataset_order)
+        corr_sub = df_corr[df_corr["ModelKey"] == model]
+        if "DatasetKey" in corr_sub.columns:
+            corr_sub = corr_sub[corr_sub["DatasetKey"].isin(dataset_order)]
+        mean_corr = corr_sub["Correlation"].mean()
         
         # 2. Get AUROCs (averaged across datasets)
         # Filter for this model
-        sub = df_det[df_det["Model"] == model]
+        sub = df_det[df_det["ModelKey"] == model]
+        if "DatasetKey" in sub.columns:
+            sub = sub[sub["DatasetKey"].isin(dataset_order)]
         
         def get_auroc(method, subset):
             rows = sub[(sub["Method"] == method) & (sub["Subset"] == subset)]
@@ -1264,8 +1450,8 @@ def write_correlation_table(df_corr: pd.DataFrame, df_det: pd.DataFrame, figures
         bold_conf_se = (se_conf > ap_conf)
 
         row = [
-            latex_escape(model),
-            f"{mean_corr:.2f}",
+            latex_escape(pretty_model(model)),
+            f"{mean_corr:.2f}" if not np.isnan(mean_corr) else "-",
             fmt(ap_full, bold_full_ap),
             fmt(se_full, bold_full_se),
             fmt(ap_conf, bold_conf_ap),
@@ -1281,7 +1467,13 @@ def write_correlation_table(df_corr: pd.DataFrame, df_det: pd.DataFrame, figures
         f.write("\n".join(lines))
 
 
-def write_calibration_error_table(df_cal: pd.DataFrame, figures_dir: Path, included_datasets: Optional[List[str]] = None) -> None:
+def write_calibration_error_table(
+    df_cal: pd.DataFrame,
+    figures_dir: Path,
+    model_order: List[str],
+    dataset_order: List[str],
+    included_datasets: Optional[List[str]] = None,
+) -> None:
     """
     Writes TCE / EER table.
     - Alpha Range: [0.05, 0.30].
@@ -1298,14 +1490,14 @@ def write_calibration_error_table(df_cal: pd.DataFrame, figures_dir: Path, inclu
     
     if df.empty: return
 
-    available_datasets = sorted(df["Dataset"].unique())
+    available_datasets = list(df["DatasetKey"].unique())
     if included_datasets is not None:
-        datasets = [d for d in available_datasets if d in included_datasets]
+        datasets = [d for d in dataset_order if d in available_datasets and d in included_datasets]
         if not datasets: datasets = available_datasets
     else:
-        datasets = available_datasets
+        datasets = [d for d in dataset_order if d in available_datasets]
 
-    models = sorted(df["Model"].unique())
+    models = [m for m in model_order if m in df["ModelKey"].unique()]
     
     # Define Single-Pass methods (Everything except the expensive sampling baseline)
     single_pass_methods = [
@@ -1328,7 +1520,7 @@ def write_calibration_error_table(df_cal: pd.DataFrame, figures_dir: Path, inclu
             eer_ucb_vals = []
             
             for d in datasets:
-                subset = df[(df["Model"] == m) & (df["Dataset"] == d) & (df["Method"] == meth)]
+                subset = df[(df["ModelKey"] == m) & (df["DatasetKey"] == d) & (df["Method"] == meth)]
                 
                 for mode in ["Empirical", "Conservative"]:
                     sub_mode = subset[subset["CalMode"] == mode]
@@ -1403,7 +1595,7 @@ def write_calibration_error_table(df_cal: pd.DataFrame, figures_dir: Path, inclu
             lines.append(r"\midrule")
             lines.append(r"\multicolumn{5}{l}{\textbf{Overall Average (Across Models)}} \\")
         else:
-            lines.append(rf"\multicolumn{{5}}{{l}}{{\textbf{{{latex_escape(ctx)}}}}} \\")
+            lines.append(rf"\multicolumn{{5}}{{l}}{{\textbf{{{latex_escape(pretty_model(ctx))}}}}} \\")
         
         # 1. Find Winners for this context
         # We track min for "All" and min for "Single Pass" (sp)
@@ -1445,7 +1637,7 @@ def write_calibration_error_table(df_cal: pd.DataFrame, figures_dir: Path, inclu
             
             is_sp = (meth in single_pass_methods)
             
-            row = [latex_escape(meth)]
+            row = [latex_escape(pretty_method(meth))]
             metrics = ["emp_tce", "emp_eer", "ucb_tce", "ucb_eer"]
             
             for m_key in metrics:
@@ -1512,9 +1704,32 @@ def main():
             "slt = second-to-last token in answer."
     )
 
+    # ---- Global style knobs ----
+    parser.add_argument("--font-scale", type=float, default=1.4,
+                        help="Seaborn font_scale multiplier (quick global resize).")
+    parser.add_argument("--base-fontsize", type=int, default=None,
+                        help="If set, overrides Matplotlib base font size (strong global control).")
+    parser.add_argument("--plot-context", type=str, default="paper",
+                        choices=["paper", "talk", "poster"],
+                        help="Seaborn context preset. 'poster' is helpful for A0.")
+    parser.add_argument("--dpi", type=int, default=300,
+                        help="DPI for raster outputs (png). Increase for posters.")
+
 
 
     args = parser.parse_args()
+
+    # Apply plotting style AFTER parsing args (so CLI controls it)
+    configure_plotting(args.font_scale, args.base_fontsize, args.plot_context)
+    profile = "poster_gemini" if args.plot_context == "poster" else "paper_times"
+    apply_tex_font_profile(profile)
+
+    # Desired ordering 
+    model_order = [Path(m).name for m in DEFAULT_TARGET_MODELS]
+    dataset_order = list(DEFAULT_TARGET_DATASETS)
+
+    # map safe->full id when available, but allow safe names too
+    safe_to_full = {Path(m).name: m for m in DEFAULT_TARGET_MODELS}
 
     repo_root, runs_root = resolve_paths(args.runs_root)
     figures_dir = repo_root / args.figures_dirname
@@ -1540,11 +1755,11 @@ def main():
         retrain=args.retrain_probes,
     )
 
-    for model_name in DEFAULT_TARGET_MODELS:
-        safe_model = Path(model_name).name
+    for safe_model in model_order:
+        model_name = safe_to_full.get(safe_model, safe_model)
         curve_data[safe_model] = {}
 
-        for dataset_name in DEFAULT_TARGET_DATASETS:
+        for dataset_name in dataset_order:
             run_dir = find_run_directory(runs_root, model_name, dataset_name)
             if not run_dir:
                 target_folder = f"{safe_model}__{dataset_name}"
@@ -1589,8 +1804,10 @@ def main():
 
             # layer sensitivity data
             layer_results.append({
-                "Model": safe_model,
-                "Dataset": dataset_name,
+                "ModelKey": safe_model,
+                "Model": pretty_model(safe_model),
+                "DatasetKey": dataset_name,
+                "Dataset": pretty_dataset(dataset_name),
                 "acc_cv_aucs": bundle.get("acc_cv_aucs", []),
                 "se_cv_aucs": bundle.get("se_cv_aucs", []),
             })
@@ -1679,16 +1896,19 @@ def main():
 
     
                 corr_results.append({
-                    "Model": safe_model,
-                    "Dataset": dataset_name,
+                    "ModelKey": safe_model,
+                    "Model": pretty_model(safe_model),
+                    "DatasetKey": dataset_name,
+                    "Dataset": pretty_dataset(dataset_name),
                     "Correlation": corr
                 })
                 
                 # Save scatter plot for the first dataset or specific ones
                 if dataset_name == "trivia_qa":  # or always
                     plot_correlation_scatter(
-                        df_test, safe_model, dataset_name, 
-                        figures_dir / f"scatter_{safe_model}_{dataset_name}.png"
+                        df_test, pretty_model(safe_model), pretty_dataset(dataset_name), 
+                        figures_dir / f"scatter_{safe_model}_{dataset_name}.png",
+                        dpi=args.dpi,
                     )
 
             # confident subset defined on test only
@@ -1727,8 +1947,22 @@ def main():
                 except Exception:
                     auprc_full = 0.0
 
-                det_results.append({"Model": safe_model, "Dataset": dataset_name, "Method": m_name, "Subset": "Full", "AUROC": float(auc_full),  "AUPRC": float(auprc_full)})
-                det_results.append({"Model": safe_model, "Dataset": dataset_name, "Method": m_name, "Subset": "Confident", "AUROC": float(auc_conf)})
+                det_results.append({
+                    "ModelKey": safe_model,
+                    "Model": pretty_model(safe_model),
+                    "DatasetKey": dataset_name,
+                    "Dataset": pretty_dataset(dataset_name),
+                    "Method": m_name, "Subset": "Full",
+                    "AUROC": float(auc_full), "AUPRC": float(auprc_full)
+                })
+                det_results.append({
+                    "ModelKey": safe_model,
+                    "Model": pretty_model(safe_model),
+                    "DatasetKey": dataset_name,
+                    "Dataset": pretty_dataset(dataset_name),
+                    "Method": m_name, "Subset": "Confident",
+                    "AUROC": float(auc_conf)
+                })
 
                 # risk-coverage curve (test)
                 covs, risks = get_risk_coverage_curve(df_test, col)
@@ -1743,12 +1977,14 @@ def main():
                 naurc_val = compute_normalized_aurcc(covs, risks, base_risk)
 
                 aurc_results.append({
-                    "Model": safe_model, 
-                    "Dataset": dataset_name, 
-                    "Method": m_name, 
+                    "ModelKey": safe_model,
+                    "Model": pretty_model(safe_model),
+                    "DatasetKey": dataset_name,
+                    "Dataset": pretty_dataset(dataset_name),
+                    "Method": m_name,
                     "AURC": aurc_val,
                     "nAURCC": naurc_val,
-                    "Correlation": corr  # Save correlation to this row (repeated)
+                    "Correlation": corr
                 })
 
                 # calibration: threshold on cal, evaluate on test
@@ -1759,8 +1995,10 @@ def main():
                     for alpha in all_alphas:
                         r, c = eval_calibration(df, col, float(alpha), args.delta, use_ucb=use_ucb_flag)
                         cal_results.append({
-                            "Model": safe_model,
-                            "Dataset": dataset_name,
+                            "ModelKey": safe_model,
+                            "Model": pretty_model(safe_model),
+                            "DatasetKey": dataset_name,
+                            "Dataset": pretty_dataset(dataset_name),
                             "Method": m_name,
                             "Target": float(alpha),
                             "CalMode": mode_name,
@@ -1783,7 +2021,8 @@ def main():
                         delta=args.delta,
                         use_ucb=args.use_ucb,
                         out_path=out_path,
-                        title=f"{safe_model} / {dataset_name} — Decision Boundary ({dm})",
+                        title=f"{pretty_model(safe_model)} / {pretty_dataset(dataset_name)} — Decision Boundary ({dm})",
+                        dpi=args.dpi,
                     )
 
     # Save CSVs
@@ -1800,26 +2039,31 @@ def main():
     # Plots
     print("Generating plots...")
     if not df_det.empty:
-        plot_detection_bars(df_det, figures_dir)
+        plot_detection_bars(df_det, figures_dir, model_order, dataset_order, dpi=args.dpi)
     if layer_results:
-        plot_layer_sensitivity(layer_results, figures_dir)
+        plot_layer_sensitivity(layer_results, figures_dir, dpi=args.dpi)
     if curve_data:
-        plot_risk_coverage(curve_data, figures_dir, base_risks)
+        plot_risk_coverage(curve_data, figures_dir, base_risks, dpi=args.dpi)
     if not df_cal.empty:
-        plot_calibration_curves(df_cal, figures_dir)
+        plot_calibration_curves(df_cal, figures_dir, model_order, dataset_order, dpi=args.dpi)
 
     # Tables
     print("Generating LaTeX tables...")
     if not df_det.empty:
-        write_detection_table(df_det, base_risks, figures_dir)
+        write_detection_table(df_det, base_risks, figures_dir, model_order=model_order, dataset_order=dataset_order)
     if not df_aurc.empty:
-        write_aurc_table(df_aurc, figures_dir)
-        write_naurcc_table(df_aurc, figures_dir)
+        write_aurc_table(df_aurc, figures_dir, model_order=model_order, dataset_order=dataset_order)
+        write_naurcc_table(df_aurc, figures_dir, model_order=model_order, dataset_order=dataset_order)
+
     if not df_cal.empty:
-        write_calibration_error_table(df_cal, figures_dir,
-                                      included_datasets=["trivia_qa"])
+        write_calibration_error_table(
+            df_cal, figures_dir,
+            model_order=model_order,
+            dataset_order=dataset_order,
+            included_datasets=["trivia_qa"],
+        )
     if not df_corr.empty and not df_det.empty:       
-        write_correlation_table(df_corr, df_det, figures_dir)
+        write_correlation_table(df_corr, df_det, figures_dir, model_order=model_order, dataset_order=dataset_order)
         
 
     print(f"Done! Artifacts saved to: {figures_dir}")
