@@ -99,6 +99,14 @@ def pretty_model(model_key: str) -> str:
 def pretty_dataset(ds_key: str) -> str:
     return PRETTY_DATASET_NAMES.get(ds_key, ds_key)
 
+def file_safe(s: str) -> str:
+    """
+    Make a string safe for filenames.
+    Keeps alphanumerics, dash, underscore.
+    """
+    return "".join(c if c.isalnum() or c in "-_" else "_" for c in s)
+
+
 def configure_plotting(font_scale: float, base_fontsize: Optional[int], context: str) -> None:
     """
     Centralized plotting config. Use CLI flags to increase fonts e.g. for posters.
@@ -624,7 +632,7 @@ def plot_detection_bars(df_det: pd.DataFrame, figures_dir: Path, model_order: Li
                     pass
             plt.tight_layout()
 
-            save_figure((figures_dir / f"detection_{model_key}_{subset}").with_suffix(""), dpi=dpi)
+            save_figure((figures_dir / f"detection_{file_safe(model_key)}_{subset}").with_suffix(""), dpi=dpi)
             plt.close()
 
 
@@ -652,7 +660,7 @@ def plot_layer_sensitivity(layer_results: List[dict], figures_dir: Path, dpi: in
         plt.tight_layout()
         safe_model = item["ModelKey"]
         ds_key = item["DatasetKey"]
-        save_figure((figures_dir / f"layers_{safe_model}_{ds_key}").with_suffix(""), dpi=dpi)
+        save_figure((figures_dir / f"layers_{file_safe(safe_model)}_{file_safe(ds_key)}").with_suffix(""), dpi=dpi)
         plt.close()
 
 
@@ -705,9 +713,8 @@ def plot_risk_coverage(curve_data: dict, figures_dir: Path, base_risks: dict, dp
             plt.ylim(0, top_lim)
             plt.grid(True, alpha=0.3)
 
-            safe_model = model.replace("/", "_")
             save_figure(
-                (figures_dir / f"rc_{safe_model}_{ds}").with_suffix(""),
+                (figures_dir / f"rc_{file_safe(model)}_{file_safe(ds)}").with_suffix(""),
                 dpi=dpi,
             )
             plt.close()
@@ -779,7 +786,7 @@ def plot_calibration_curves(df_cal: pd.DataFrame, figures_dir: Path, model_order
             plt.tight_layout()
             plt.subplots_adjust(bottom=0.2) # Make room for legend
 
-            save_figure((figures_dir / f"calibration_{model}_{ds}").with_suffix(""), dpi=dpi)
+            save_figure((figures_dir / f"calibration_{file_safe(model)}_{file_safe(ds)}").with_suffix(""), dpi=dpi)
             plt.close()
 
 
@@ -1907,7 +1914,7 @@ def main():
                 if dataset_name == "trivia_qa":  # or always
                     plot_correlation_scatter(
                         df_test, pretty_model(safe_model), pretty_dataset(dataset_name), 
-                        figures_dir / f"scatter_{safe_model}_{dataset_name}.png",
+                        figures_dir / f"scatter_{file_safe(safe_model)}_{file_safe(dataset_name)}.png",
                         dpi=args.dpi,
                     )
 
@@ -2012,7 +2019,7 @@ def main():
                 comb = fitted_combiners.get(dm)
                 if comb is not None:
                     score_col = "score_Comb_LR" if dm == "LR" else "score_Comb_MLP"
-                    out_path = figures_dir / f"boundary_{safe_model}_{dataset_name}_{dm}.png"
+                    out_path = figures_dir / f"boundary_{file_safe(safe_model)}_{file_safe(dataset_name)}_{dm}.png"
                     plot_decision_boundary(
                         df=df,
                         combiner_model=comb,
