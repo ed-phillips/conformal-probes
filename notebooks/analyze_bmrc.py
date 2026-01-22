@@ -184,11 +184,11 @@ COLORS = {
 }
 
 METHOD_ORDER = [
-    "Semantic Entropy",
     "Accuracy Probe",
     "SE Probe",
     "Combined (LR)",
     "Combined (MLP)",
+    "Semantic Entropy",
     # "Combined (GBM)",
 ]
 
@@ -600,10 +600,14 @@ def plot_detection_bars(df_det: pd.DataFrame, figures_dir: Path, model_order: Li
             if data.empty:
                 continue
             data["Dataset"] = pd.Categorical(data["Dataset"], categories=ds_pretty_order, ordered=True)
+
+            # Determine hue order dynamically as before
+            hue_order_vals = [pretty_method(m) for m in METHOD_ORDER if m in data["Method"].unique()]
+
             plt.figure(figsize=(9, 6))
             data = data.copy()
             data["MethodDisplay"] = data["Method"].map(pretty_method)
-            sns.barplot(
+            ax = sns.barplot(
                 data=data,
                 x="Dataset",
                 y="AUROC",
@@ -611,8 +615,20 @@ def plot_detection_bars(df_det: pd.DataFrame, figures_dir: Path, model_order: Li
                 palette=COLORS,
                 edgecolor="black",
                 errorbar=None,
-                hue_order=[pretty_method(m) for m in METHOD_ORDER if m in data["Method"].unique()]
+                hue_order=hue_order_vals
             )
+
+            # Iterate over the bar containers to apply hatching to Semantic Entropy
+            # Note: ax.containers aligns with hue_order
+            for bars, label in zip(ax.containers, hue_order_vals):
+                if "Semantic Entropy" in label:
+                    for bar in bars:
+                        # Set hatch pattern (/// = diagonal lines)
+                        bar.set_hatch("///")
+                        # Ensure the edge (hatch color) is dark enough
+                        bar.set_edgecolor("black")
+                        bar.set_linewidth(1.0)
+
             plt.title(f"{pretty_model(model_key)} - {subset} Subset")
             plt.ylim(0.4, 1.0)
             # Legend inside plot area
@@ -1041,13 +1057,13 @@ def write_detection_table(
         is_best_sp = (is_single_pass and val >= best_sp - 1e-6)
         
         if is_best_overall and is_best_sp:
-            # Winner of both categories: Bold + Italic
+            # Winner of both: Bold + Italic
             return rf"\textit{{\textbf{{{s}}}}}"
-        elif is_best_overall:
-            # Overall winner only (e.g. Semantic Entropy)
-            return rf"\textbf{{{s}}}"
         elif is_best_sp:
-            # Single-pass winner only
+            # Single-pass winner: BOLD (emphasize the probe success)
+            return rf"\textbf{{{s}}}"
+        elif is_best_overall:
+            # Expensive baseline winner: ITALIC
             return rf"\textit{{{s}}}"
         
         return s
@@ -1351,9 +1367,11 @@ def write_naurcc_table(
         
         if is_best_overall and is_best_sp:
             return rf"\textit{{\textbf{{{s}}}}}"
-        elif is_best_overall:
-            return rf"\textbf{{{s}}}"
         elif is_best_sp:
+            # Single-pass winner: BOLD
+            return rf"\textbf{{{s}}}"
+        elif is_best_overall:
+            # Overall winner: ITALIC
             return rf"\textit{{{s}}}"
         return s
 
@@ -1589,9 +1607,11 @@ def write_calibration_error_table(
         
         if is_best_overall and is_best_sp:
             return rf"\textit{{\textbf{{{s}}}}}"
-        elif is_best_overall:
-            return rf"\textbf{{{s}}}"
         elif is_best_sp:
+            # Single-pass winner: BOLD
+            return rf"\textbf{{{s}}}"
+        elif is_best_overall:
+            # Overall winner: ITALIC
             return rf"\textit{{{s}}}"
         return s
 
